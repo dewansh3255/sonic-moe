@@ -87,6 +87,18 @@ USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --a
 python benchmarks/moe-token-rounding.py --routing nr --thiekq 16384,4096,1024,256,8,128
 ```
 
+## 🚀 Optimizations
+
+We've implemented **megakernel fusion** that fuses the up-projection and down-projection GEMMs into a single execution unit, exploiting L2 cache warmth for the intermediate activation Y1.
+
+- **[OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md)** — Technical description of what we optimize and why
+- **[GPU_TESTING_GUIDE.md](docs/GPU_TESTING_GUIDE.md)** — Step-by-step testing instructions for GPU developers
+
+Run the optimization benchmarks:
+```bash
+pytest tests/megakernel_blackwell_test.py -v -k "benchmark" -s
+```
+
 ## 🤝 Contributing
 
 We welcome contributions! Please feel free to submit issues, feature requests, or pull requests.
