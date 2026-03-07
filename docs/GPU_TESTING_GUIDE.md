@@ -108,7 +108,9 @@ sonic-moe/
 ### Setup
 
 ```bash
+git clone <repo-url>
 cd sonic-moe
+git checkout optimizations/megakernel-blackwell
 pip install -e .
 
 # Verify environment
