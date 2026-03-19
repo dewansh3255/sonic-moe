@@ -161,8 +161,8 @@ def moe_params():
 
     x = torch.randn(T, H, dtype=torch.bfloat16, device=device)
     router_w = torch.randn(E, H, dtype=torch.bfloat16, device=device)
-    w1 = torch.randn(E, H, 2 * I, dtype=torch.bfloat16, device=device).permute(2, 1, 0)
-    w2 = torch.randn(E, I, H, dtype=torch.bfloat16, device=device).permute(2, 1, 0)
+    w1 = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
+    w2 = torch.randn(E, H, I, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
 
     return {
         "x": x, "router_w": router_w,
@@ -360,8 +360,8 @@ class TestMegakernelBenchmark:
         device = torch.device("cuda")
         x = torch.randn(T, H, dtype=torch.bfloat16, device=device)
         router_w = torch.randn(E, H, dtype=torch.bfloat16, device=device)
-        w1 = torch.randn(E, H, 2 * I, dtype=torch.bfloat16, device=device).permute(2, 1, 0)
-        w2 = torch.randn(E, I, H, dtype=torch.bfloat16, device=device).permute(2, 1, 0)
+        w1 = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
+        w2 = torch.randn(E, H, I, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
 
         stream_id = torch.cuda.current_stream().cuda_stream
 
@@ -409,8 +409,8 @@ class TestMegakernelBenchmark:
 
         x = torch.randn(T, H, dtype=torch.bfloat16, device=device)
         router_w = torch.randn(E, H, dtype=torch.bfloat16, device=device)
-        w1 = torch.randn(E, H, 2 * I, dtype=torch.bfloat16, device=device).permute(2, 1, 0)
-        w2 = torch.randn(E, I, H, dtype=torch.bfloat16, device=device).permute(2, 1, 0)
+        w1 = torch.randn(E, 2 * I, H, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
+        w2 = torch.randn(E, H, I, dtype=torch.bfloat16, device=device).permute(1, 2, 0)
 
         stream_id = torch.cuda.current_stream().cuda_stream
 
