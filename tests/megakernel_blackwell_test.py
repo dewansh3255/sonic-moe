@@ -216,6 +216,7 @@ class TestMegakernelCorrectness:
         torch.manual_seed(42)
         o_seq, logits_seq, freq_seq = moe_TC_softmax_topk_layer(
             x=moe_params["x"],
+            router_w=moe_params["router_w"],
             w1=moe_params["w1"],
             b1=None,
             w2=moe_params["w2"],
