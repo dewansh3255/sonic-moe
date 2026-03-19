@@ -155,11 +155,13 @@ def _fused_up_down_projection_forward(
         )
     )
 
+    # ── CPU Dispatch Preparation ────────────────────────────────────
+    # Calculate caching and convert all DLPack parameters UP FRONT so that 
+    # Phase 1 and Phase 2 can be dispatched back-to-back on the GPU with zero gap, 
+    # enabling maximum implicit TMA overlap.
+    
     current_stream = cuda.CUstream(stream_id)
 
-    # ── Phase 1: Up-projection GEMM(X × W1) + SwiGLU → Y1 ──────────────
-    # This is the standard up-proj kernel. After completion, Y1 is in HBM
-    # AND warm in the L2 cache (TMA store populates L2).
     compile_w1_key = (
         "megakernel_up",
         E, H, I_w1,
@@ -187,26 +189,9 @@ def _fused_up_down_projection_forward(
         _fused_up_down_projection_forward.compile_cache[("tensormap_w1",)] = tensormaps
 
     w1_tensormaps = _fused_up_down_projection_forward.compile_cache[("tensormap_w1",)]
-    _fused_up_down_projection_forward.compile_cache[compile_w1_key](
-        mX, mW1, mZ, mY1, mB1,
-        mE_offset, mX_gather,
-        w1_tensormaps[0], w1_tensormaps[1],
-        mE_permute_order, current_stream,
-    )
+    p1_compiled = _fused_up_down_projection_forward.compile_cache[compile_w1_key]
 
-    # ── Phase 2: Down-projection GEMM(Y1 × W2) → Y2 ────────────────────
-    # Y1 is now in HBM AND warm in L2 cache from Phase 1's TMA store.
-    # When Phase 2's TMA loads Y1 tiles, they hit L2 instead of HBM.
-    #
-    # Estimated savings for Y1 L2 hit vs HBM read:
-    #   Y1 size: T × I × 2 bytes (BF16)
-    #   H100 L2 cache: 50 MB, L2 bandwidth: ~12 TB/s
-    #   H100 HBM bandwidth: ~3.35 TB/s
-    #   Speedup factor for Y1 load: ~3.6x (L2 vs HBM)
-    #
-    # For T=4096, I=4096: Y1 = 32 MB → fits in L2 → full L2 hit
-    # For T=16384, I=4096: Y1 = 128 MB → partial L2 hit
-
+    # Convert Phase 2 parameters BEFORE dispatching Phase 1
     mW2 = convert_torch_tensor_to_cute_tensor(
         w2.detach(), (2, 0, 1), 1, 16, 8, stream=stream_id
     )
@@ -239,13 +224,25 @@ def _fused_up_down_projection_forward(
         _fused_up_down_projection_forward.compile_cache[("tensormap_w2",)] = tensormaps_w2
 
     w2_tensormaps = _fused_up_down_projection_forward.compile_cache[("tensormap_w2",)]
-    _fused_up_down_projection_forward.compile_cache[compile_w2_key](
+    p2_compiled = _fused_up_down_projection_forward.compile_cache[compile_w2_key]
+
+    # ── Kernel Dispatches (Zero-Gap Execution) ──────────────────────
+    
+    # Dispatch Phase 1: Up-projection GEMM(X × W1) + SwiGLU → Y1
+    p1_compiled(
+        mX, mW1, mZ, mY1, mB1,
+        mE_offset, mX_gather,
+        w1_tensormaps[0], w1_tensormaps[1],
+        mE_permute_order, current_stream,
+    )
+
+    # Immediately Dispatch Phase 2: Down-projection GEMM(Y1 × W2) → Y2
+    p2_compiled(
         mY1_input, mW2, mY2, mB2,
         mE_offset, mX_gather,
         w2_tensormaps[0],
         mE_permute_order, current_stream,
     )
-
 
 _fused_up_down_projection_forward.compile_cache = {}
 
