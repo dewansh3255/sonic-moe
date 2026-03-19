@@ -267,8 +267,8 @@ class TestMegakernelCorrectness:
             stream_id=stream_id,
         )
 
-        loss = o.sum()
-        loss.backward()
+        grad_out = torch.randn_like(o)
+        o.backward(grad_out)
 
         assert x.grad is not None, "No gradient for x"
         assert w1.grad is not None, "No gradient for w1"
