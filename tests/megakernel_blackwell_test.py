@@ -369,7 +369,7 @@ class TestMegakernelBenchmark:
         def run_sequential():
             torch.manual_seed(42)
             return moe_TC_softmax_topk_layer(
-                x=x, w1=w1, b1=None, w2=w2, b2=None,
+                x=x, router_w=router_w, w1=w1, b1=None, w2=w2, b2=None,
                 K=K, stream_id=stream_id,
             )
 
