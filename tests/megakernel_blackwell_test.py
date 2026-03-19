@@ -371,6 +371,7 @@ class TestMegakernelBenchmark:
             return moe_TC_softmax_topk_layer(
                 x=x, router_w=router_w, w1=w1, b1=None, w2=w2, b2=None,
                 K=K, stream_id=stream_id,
+                is_inference_mode_enabled=True,
             )
 
         # Benchmark megakernel
@@ -379,6 +380,7 @@ class TestMegakernelBenchmark:
             return moe_megakernel_forward(
                 x=x, router_w=router_w, w1=w1, b1=None, w2=w2, b2=None,
                 K=K, stream_id=stream_id,
+                is_inference_mode_enabled=True,
             )
 
         time_seq = self._benchmark_fn(run_sequential)
@@ -419,6 +421,7 @@ class TestMegakernelBenchmark:
             return moe_megakernel_forward(
                 x=x, router_w=router_w, w1=w1, b1=None, w2=w2, b2=None,
                 K=K, stream_id=stream_id,
+                is_inference_mode_enabled=True,
             )
 
         time_ms = self._benchmark_fn(run, warmup=10, iterations=50)
