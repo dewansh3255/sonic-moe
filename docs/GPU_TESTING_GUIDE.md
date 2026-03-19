@@ -246,9 +246,9 @@ Notes / Issues:
 
 | Issue | Solution |
 |---|---|
-| `ModuleNotFoundError: cutlass` | Install: `pip install cutlass-cute-dsl` |
+| `ModuleNotFoundError: cutlass` | Install: `pip install nvidia-cutlass-dsl` |
 | `CUDA out of memory` | Reduce T in test configs or use a GPU with more VRAM |
 | `RuntimeError: CUDA error` | Check CUDA driver version matches toolkit |
 | Test hangs at compilation | First run compiles CuTeDSL kernels (~30s). Subsequent runs use cache. |
 | Speedup is negative | Normal for very small configs where overhead dominates |
-| `ImportError: quack` | Install quack: check SonicMoE README for installation |
+| `ImportError: quack` | Install quack: `pip install quack-kernels==0.2.5` |
