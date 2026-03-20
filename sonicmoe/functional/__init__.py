@@ -130,11 +130,15 @@ class _UpProjection(torch.autograd.Function):
         TK = total_expert_freq
 
         # Determine if fused kernel should be used:
+        # - Explicitly enabled via SONICMOE_ENABLE_FUSED_KERNEL=1
+        #   (disabled by default until kernel-level SMEM changes are complete)
         # - n ≤ 256 (SMEM budget: y1 tile = 128 × 256 × 2B = 65KB fits in 227KB)
         # - Not using QuACK GEMM (Blackwell path)
         # - SwiGLU activation (extend to other GLU activations later)
+        _fused_kernel_enabled = os.environ.get("SONICMOE_ENABLE_FUSED_KERNEL", "0") == "1"
         use_fused_kernel = (
-            not is_using_quack_gemm()
+            _fused_kernel_enabled
+            and not is_using_quack_gemm()
             and I <= 256
             and w2 is not None
             and is_glu_activation
