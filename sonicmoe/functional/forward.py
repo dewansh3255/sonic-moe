@@ -12,7 +12,7 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 
 from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from ..utils import convert_torch_tensor_to_cute_tensor
-from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
+from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_FusedUpDown_Fwd, HopperWgmma_MoE_Up_proj_Fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 from .topk_softmax import TopK_Softmax
 
@@ -176,6 +176,95 @@ def _down_projection_forward(
 
 
 _down_projection_forward.compile_cache = {}
+
+FUSED_TENSORMAP = "FUSED_TENSORMAP"
+
+
+@torch.library.custom_op(f"{LIBRARY_NAME}::_fused_up_down_projection_forward", mutates_args={"z", "y2"})
+def _fused_up_down_projection_forward(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    z: torch.Tensor,
+    y2: torch.Tensor,
+    b1: torch.Tensor | None,
+    b2: torch.Tensor | None,
+    expert_frequency_offset: torch.Tensor,
+    expert_schedule_order: torch.Tensor,
+    x_gather_idx: torch.Tensor,
+    stream_id: int,
+    activation_type: str,
+    is_glu_activation: bool,
+    is_inference_mode_enabled: bool = False,
+) -> None:
+    """Fused up+down projection forward pass.
+    
+    Performs up-projection (X @ W1 → SwiGLU → y1) and down-projection (y1 @ W2 → y2)
+    in a single kernel launch. The intermediate y1 tensor stays in SMEM and never 
+    touches HBM, eliminating a round-trip of ~200MB for the 7B config.
+    
+    Only supported for n ≤ 256 (SMEM budget constraint on Hopper).
+    """
+    I_w1, H, E = w1.size()
+    H_w2, I_w2, E_w2 = w2.size()
+    if is_glu_activation:
+        I = I_w1 // 2
+    else:
+        I = I_w1
+
+    mX = convert_torch_tensor_to_cute_tensor(x.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+    mW1 = convert_torch_tensor_to_cute_tensor(w1.detach(), (2, 0, 1), 1, 16, 8, stream=stream_id)
+    mW2 = convert_torch_tensor_to_cute_tensor(w2.detach(), (2, 0, 1), 1, 16, 8, stream=stream_id)
+    mZ = convert_torch_tensor_to_cute_tensor(z, (0, 1), 1, 16, 8, stream=stream_id)
+    mY2 = convert_torch_tensor_to_cute_tensor(y2, (0, 1), 1, 16, 8, stream=stream_id)
+    mE_offset = convert_torch_tensor_to_cute_tensor(expert_frequency_offset, (0,), 0, 4, 1, stream=stream_id)
+    mX_gather = convert_torch_tensor_to_cute_tensor(x_gather_idx, (0,), 0, 4, 1, stream=stream_id)
+
+    if expert_schedule_order is None:
+        mE_permute_order = None
+    else:
+        mE_permute_order = convert_torch_tensor_to_cute_tensor(expert_schedule_order, (0,), 0, 4, 1, stream=stream_id)
+
+    if b1 is None:
+        mB1 = None
+    else:
+        mB1 = convert_torch_tensor_to_cute_tensor(b1.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+
+    if b2 is None:
+        mB2 = None
+    else:
+        mB2 = convert_torch_tensor_to_cute_tensor(b2.detach(), (0, 1), 1, 16, 8, stream=stream_id)
+
+    current_stream = cuda.CUstream(stream_id)
+
+    compile_key = (E, H, I, H_w2, (b1 is None), (b2 is None), x.dtype, activation_type, is_inference_mode_enabled)
+    if compile_key not in _fused_up_down_projection_forward.compile_cache:
+        fused_module = HopperWgmma_MoE_FusedUpDown_Fwd(
+            E, H, I, activation_type=ActivationType(activation_type), inference_mode=is_inference_mode_enabled
+        )
+        # Generate tensormaps: z (up-proj D output), y2 (down-proj D output), W2 (down-proj B input)
+        tensormaps = [fused_module.module.generate_tensormap(None, None, None) for _ in range(4)]
+        _fused_up_down_projection_forward.compile_cache[compile_key] = cute.compile(
+            fused_module,
+            mX, mW1, mW2, mZ, mY2, mB1, mB2,
+            mE_offset, mX_gather,
+            tensormaps[0], tensormaps[1], tensormaps[2], tensormaps[3],
+            mE_permute_order,
+            current_stream,
+        )
+        _fused_up_down_projection_forward.compile_cache[FUSED_TENSORMAP] = tensormaps
+
+    fused_tensormaps = _fused_up_down_projection_forward.compile_cache[FUSED_TENSORMAP]
+    _fused_up_down_projection_forward.compile_cache[compile_key](
+        mX, mW1, mW2, mZ, mY2, mB1, mB2,
+        mE_offset, mX_gather,
+        fused_tensormaps[0], fused_tensormaps[1], fused_tensormaps[2], fused_tensormaps[3],
+        mE_permute_order,
+        current_stream,
+    )
+
+
+_fused_up_down_projection_forward.compile_cache = {}
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_router_forward", mutates_args={"o"})

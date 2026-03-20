@@ -100,7 +100,9 @@ class HopperWgmma_MoE_kernel:
         inference_mode: bool = False,
         L2_group_size: int = 8,
         raster_order: RasterOrderOption = RasterOrderOption.Heuristic,
+        fuse_down_projection: bool = False,
     ):
+        self.fuse_down_projection = fuse_down_projection
         self.epi_tile_size = epi_tile_size
         self.initial_d_epi_stage = initial_d_epi_stage
 

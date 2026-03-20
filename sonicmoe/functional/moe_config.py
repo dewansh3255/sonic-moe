@@ -233,6 +233,127 @@ class HopperWgmma_MoE_Down_proj_Fwd:
         )
 
 
+class HopperWgmma_MoE_FusedUpDown_Fwd:
+    """
+    Fused up-projection + down-projection kernel for fine-grained MoE (n ≤ 256).
+    
+    Eliminates the HBM round-trip for the A tensor (post-SwiGLU y1) by keeping it 
+    in a persistent SMEM slot. Phase 1 (up-proj) writes y1 to SMEM instead of HBM.
+    Phase 2 (down-proj) reads y1 from SMEM and streams W2 tiles to produce y2.
+    
+    SMEM budget (n=256, Mtile=128):
+      Phase 1 peak: ~176 KB (X + W1 pipelines + z epilogue)
+      Phase 2 peak: ~193 KB (sA_fused 65KB + W2 pipeline + y2 epilogue)
+      Both < 227 KB ✓
+    
+    Expected gain: +4.8% forward TFLOPS (7B config), +7.6% (30B config).
+    """
+    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False):
+        super().__init__()
+        is_glu_activation = is_glu(activation_type)
+        
+        # SMEM budget constraint: y1 tile = Mtile × I × 2B must fit
+        # At n=256, Mtile=128: 128 × 256 × 2 = 65KB → total peak 193KB < 227KB
+        assert I <= 256, (
+            f"Fused up+down kernel requires n ≤ 256 for SMEM budget. "
+            f"Got n={I}. Use standard separate kernels for n > 256."
+        )
+        
+        if is_glu_activation:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 64 == 0
+            ), f"{LIBRARY_NAME} only supports GLU MoE with H % 64 == 0 (H >= 512) and I % 64 == 0"
+        else:
+            assert (
+                H % 64 == 0 and H >= 512 and I % 128 == 0
+            ), f"{LIBRARY_NAME} only supports non-GLU MoE with H % 64 == 0 (H >= 512) and I % 128 == 0"
+
+        # Same tile config as standard up-proj for this I range
+        if (I >= 128 and is_glu_activation) or (I >= 256 and not is_glu_activation):
+            up_config = HopperGEMMConfig(
+                tile_shape_mnk=(128, 256, 64),
+                cluster_shape_mnk=(2, 1),
+                epi_tile_size=(32 if not inference_mode else 64),
+                is_pingpong=False,
+                initial_d_epi_stage=2,
+                raster_order=RasterOrderOption.AlongM,
+            )
+        elif (I == 64 and is_glu_activation) or (I == 128 and not is_glu_activation):
+            up_config = HopperGEMMConfig(
+                tile_shape_mnk=(192, 128, 64),
+                cluster_shape_mnk=(1, 1),
+                epi_tile_size=(32 if not inference_mode else 64),
+                is_pingpong=True,
+                initial_d_epi_stage=8,
+                raster_order=RasterOrderOption.AlongM,
+            )
+        else:
+            raise NotImplementedError()
+
+        compute_swiglu = activation_type == ActivationType.SWIGLU
+        compute_geglu = activation_type == ActivationType.GEGLU
+        compute_reglu = activation_type == ActivationType.REGLU
+        compute_relu_sq = activation_type == ActivationType.RELU_SQ
+        compute_relu = activation_type == ActivationType.RELU
+        compute_silu = activation_type == ActivationType.SILU
+        compute_gelu = activation_type == ActivationType.GELU
+
+        self.module = HopperWgmma_MoE_kernel(
+            E,
+            cutlass.Float32,
+            up_config.tile_shape_mnk,
+            (*up_config.cluster_shape_mnk, 1),
+            pingpong=up_config.is_pingpong,
+            is_persistent=True,
+            compute_swiglu=compute_swiglu,
+            compute_reglu=compute_reglu,
+            compute_geglu=compute_geglu,
+            compute_relu_sq=compute_relu_sq,
+            compute_relu=compute_relu,
+            compute_silu=compute_silu,
+            compute_gelu=compute_gelu,
+            is_A_gather=True,
+            epi_tile_size=up_config.epi_tile_size,
+            initial_d_epi_stage=up_config.initial_d_epi_stage,
+            inference_mode=inference_mode,
+            fuse_down_projection=True,
+        )
+        self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
+            up_config.cluster_shape_mnk[0] * up_config.cluster_shape_mnk[1]
+        )
+        self.current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    @cute.jit
+    def __call__(
+        self, mX, mW1, mW2, mZ, mY2, mB1, mB2,
+        mE_offset, mX_gather, mD_tensormap, mZ_tensormap, mY2_tensormap,
+        mW2_tensormap, mE_permute_order, stream
+    ):
+        return self.module(
+            mX,
+            mW1,
+            None,  # mC (not used in forward)
+            mB1,
+            mZ,
+            None,  # mY1 — stays in SMEM, never written to HBM
+            None,  # mS (not used)
+            None,  # mDS_partial (not used)
+            mE_offset,
+            mX_gather,
+            mW2,         # additional: W2 weights for Phase 2
+            mY2,         # additional: y2 output tensor
+            mB2,         # additional: W2 bias
+            mY2_tensormap,  # additional: TMA descriptor for y2
+            mW2_tensormap,  # additional: TMA descriptor for W2
+            mD_tensormap,   # z TMA descriptor
+            mZ_tensormap,   # z TMA descriptor (second)
+            None,
+            mE_permute_order,
+            const_expr(self.max_active_clusters),
+            stream,
+        )
+
+
 class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
     def __init__(self, E: int, H: int, I: int, activation_type: ActivationType):
         super().__init__()

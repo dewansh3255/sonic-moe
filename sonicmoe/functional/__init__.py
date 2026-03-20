@@ -19,9 +19,21 @@ from .backward import (
     _up_projection_backward_act,
     _up_projection_backward_weight,
 )
-from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
+from .forward import (
+    _down_projection_forward,
+    _fused_up_down_projection_forward,
+    _router_forward,
+    _softmax_topk_fwd,
+    _up_projection_forward,
+)
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_quack_gemm, is_using_quack_gemm
+
+# Module-level cache for fused y2 tensor pass-through.
+# When O1 fused kernel is used, _UpProjection.forward stores y2 here,
+# and the caller retrieves it to pass to _DownProjection.apply.
+# Cleared after each use to avoid stale references.
+_fused_y2_cache = {}
 
 
 def general_routing_router_metadata(
@@ -96,6 +108,8 @@ class _UpProjection(torch.autograd.Function):
         x: torch.Tensor,
         w1: torch.Tensor,
         b1: torch.Tensor | None,
+        w2: torch.Tensor,
+        b2: torch.Tensor | None,
         expert_frequency_offset: torch.Tensor,
         total_expert_freq: int,
         K: int,
@@ -115,6 +129,17 @@ class _UpProjection(torch.autograd.Function):
             I //= 2
         TK = total_expert_freq
 
+        # Determine if fused kernel should be used:
+        # - n ≤ 256 (SMEM budget: y1 tile = 128 × 256 × 2B = 65KB fits in 227KB)
+        # - Not using QuACK GEMM (Blackwell path)
+        # - SwiGLU activation (extend to other GLU activations later)
+        use_fused_kernel = (
+            not is_using_quack_gemm()
+            and I <= 256
+            and w2 is not None
+            and is_glu_activation
+        )
+
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
@@ -126,6 +151,30 @@ class _UpProjection(torch.autograd.Function):
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
             )
+        elif use_fused_kernel:
+            # O1: Fused up+down projection — y1 stays in SMEM, never touches HBM
+            H_model = w2.size(0)  # w2 is (H, I, E)
+            z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
+            y2 = torch.empty(TK, H_model, dtype=x.dtype, device=x.device)
+            _fused_up_down_projection_forward(
+                x=x,
+                w1=w1,
+                w2=w2,
+                z=z,
+                y2=y2,
+                b1=b1,
+                b2=b2,
+                expert_frequency_offset=expert_frequency_offset,
+                expert_schedule_order=None,
+                x_gather_idx=x_gather_idx,
+                stream_id=stream_id,
+                activation_type=activation_type.value,
+                is_glu_activation=is_glu_activation,
+                is_inference_mode_enabled=is_inference_mode_enabled,
+            )
+            y1 = None  # Signal to _DownProjection that y2 is pre-computed
+            # Store y2 in module-level cache for the caller to retrieve
+            _fused_y2_cache['y2'] = y2
         else:
             z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
             y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
@@ -153,6 +202,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.is_varlen_K = is_varlen_K
         ctx.is_glu_activation = is_glu_activation
         ctx.stream_id = stream_id
+        ctx.use_fused_kernel = use_fused_kernel
 
         ctx.save_for_backward(
             x,
@@ -165,7 +215,8 @@ class _UpProjection(torch.autograd.Function):
             num_activated_expert_per_token_offset,
         )
 
-        ctx.mark_non_differentiable(y1)
+        if y1 is not None:
+            ctx.mark_non_differentiable(y1)
         ctx.set_materialize_grads(False)
 
         return y1, z
@@ -252,7 +303,7 @@ class _UpProjection(torch.autograd.Function):
             is_varlen_K=is_varlen_K,
         )
 
-        return dx_reduced, dw1, db1, *[None] * 12
+        return dx_reduced, dw1, db1, *[None] * 14
 
 
 class _DownProjection(torch.autograd.Function):
@@ -274,16 +325,22 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        fused_y2: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        TK = y1.size(0)
         H, I, E = w2.shape
 
-        if is_using_quack_gemm():
+        if fused_y2 is not None:
+            # O1 Fused path: y2 was already computed by the fused up+down kernel
+            # y1 is None, skip the GEMM entirely and go straight to aggregation
+            y2 = fused_y2
+            TK = y2.size(0)
+        elif is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
-
+            TK = y1.size(0)
             assert b2 is None
             y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
         else:
+            TK = y1.size(0)
             y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
             _down_projection_forward(
                 w2=w2,
@@ -422,7 +479,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, *[None] * 10
+        return None, dz, dw2, db2, ds, *[None] * 11
 
 
 def moe_TC_softmax_topk_layer(
@@ -467,6 +524,8 @@ def moe_TC_softmax_topk_layer(
         x,
         w1,
         b1,
+        w2,
+        b2,
         expert_frequency_offset,
         T * K,
         K,
@@ -479,6 +538,9 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
     )
+
+    # When fused kernel is used, y1 is None and y2 is in _fused_y2_cache
+    fused_y2 = _fused_y2_cache.pop('y2', None) if y1 is None else None
 
     o = _DownProjection.apply(
         y1,
@@ -496,6 +558,7 @@ def moe_TC_softmax_topk_layer(
         None,
         False,  # is_varlen_K
         activation_type,
+        fused_y2,
     )
 
     return o, router_logits, expert_frequency
@@ -544,6 +607,8 @@ def moe_general_routing_inputs(
         x,
         w1,
         b1,
+        w2,
+        b2,
         expert_frequency_offset,
         TK,
         None,  # K, not needed
@@ -556,6 +621,9 @@ def moe_general_routing_inputs(
         activation_type,
         is_inference_mode_enabled,
     )
+
+    # When fused kernel is used, y1 is None and y2 is in _fused_y2_cache
+    fused_y2 = _fused_y2_cache.pop('y2', None) if y1 is None else None
 
     o = _DownProjection.apply(
         y1,
@@ -573,6 +641,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,  # is_varlen_K
         activation_type,
+        fused_y2,
     )
 
     return o, expert_frequency
