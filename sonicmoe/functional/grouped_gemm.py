@@ -797,7 +797,8 @@ class HopperWgmma_MoE_kernel:
             self.bias_dtype = None
             self.bias_layout = None
 
-        if const_expr(self.need_adhoc_epilogue_store):
+        # If fuse_down_projection is True, we don't store mY to HBM, so mY is None.
+        if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
             self.y_dtype = mY.element_type
             self.y_layout = utils.LayoutEnum.from_tensor(mY)
         else:

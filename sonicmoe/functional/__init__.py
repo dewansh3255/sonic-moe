@@ -29,12 +29,6 @@ from .forward import (
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_quack_gemm, is_using_quack_gemm
 
-# Module-level cache for fused y2 tensor pass-through.
-# When O1 fused kernel is used, _UpProjection.forward stores y2 here,
-# and the caller retrieves it to pass to _DownProjection.apply.
-# Cleared after each use to avoid stale references.
-_fused_y2_cache = {}
-
 
 def general_routing_router_metadata(
     router_scores_selected: torch.Tensor, sorted_selected_T: torch.Tensor, selected_E: torch.Tensor, T: int, E: int
@@ -130,15 +124,11 @@ class _UpProjection(torch.autograd.Function):
         TK = total_expert_freq
 
         # Determine if fused kernel should be used:
-        # - Explicitly enabled via SONICMOE_ENABLE_FUSED_KERNEL=1
-        #   (disabled by default until kernel-level SMEM changes are complete)
         # - n ≤ 256 (SMEM budget: y1 tile = 128 × 256 × 2B = 65KB fits in 227KB)
         # - Not using QuACK GEMM (Blackwell path)
         # - SwiGLU activation (extend to other GLU activations later)
-        _fused_kernel_enabled = os.environ.get("SONICMOE_ENABLE_FUSED_KERNEL", "0") == "1"
         use_fused_kernel = (
-            _fused_kernel_enabled
-            and not is_using_quack_gemm()
+            not is_using_quack_gemm()
             and I <= 256
             and w2 is not None
             and is_glu_activation
@@ -155,6 +145,7 @@ class _UpProjection(torch.autograd.Function):
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
             )
+            y2_fused = None
         elif use_fused_kernel:
             # O1: Fused up+down projection — y1 stays in SMEM, never touches HBM
             H_model = w2.size(0)  # w2 is (H, I, E)
@@ -177,8 +168,7 @@ class _UpProjection(torch.autograd.Function):
                 is_inference_mode_enabled=is_inference_mode_enabled,
             )
             y1 = None  # Signal to _DownProjection that y2 is pre-computed
-            # Store y2 in module-level cache for the caller to retrieve
-            _fused_y2_cache['y2'] = y2
+            y2_fused = y2
         else:
             z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
             y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
@@ -196,6 +186,7 @@ class _UpProjection(torch.autograd.Function):
                 is_glu_activation=is_glu_activation,
                 is_inference_mode_enabled=is_inference_mode_enabled,
             )
+            y2_fused = None
 
         ctx.T = T
         ctx.TK = TK
@@ -223,7 +214,7 @@ class _UpProjection(torch.autograd.Function):
             ctx.mark_non_differentiable(y1)
         ctx.set_materialize_grads(False)
 
-        return y1, z
+        return y1, z, y2_fused
 
     @staticmethod
     def backward(ctx, _: None, dz: torch.Tensor):
@@ -524,7 +515,7 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
-    y1, z = _UpProjection.apply(
+    y1, z, fused_y2 = _UpProjection.apply(
         x,
         w1,
         b1,
@@ -542,9 +533,6 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
     )
-
-    # When fused kernel is used, y1 is None and y2 is in _fused_y2_cache
-    fused_y2 = _fused_y2_cache.pop('y2', None) if y1 is None else None
 
     o = _DownProjection.apply(
         y1,
@@ -607,7 +595,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
     ) = general_routing_router_metadata(router_scores, token_indices, expert_indices, T, E)
 
-    y1, z = _UpProjection.apply(
+    y1, z, fused_y2 = _UpProjection.apply(
         x,
         w1,
         b1,
@@ -625,9 +613,6 @@ def moe_general_routing_inputs(
         activation_type,
         is_inference_mode_enabled,
     )
-
-    # When fused kernel is used, y1 is None and y2 is in _fused_y2_cache
-    fused_y2 = _fused_y2_cache.pop('y2', None) if y1 is None else None
 
     o = _DownProjection.apply(
         y1,
