@@ -559,38 +559,10 @@ def moe_megakernel_forward(
     stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
+    routing: str = "top_k",
+    Mtile: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Forward pass with L2-cache-warm megakernel fusion.
-
-    Drop-in replacement for moe_TC_softmax_topk_layer() with identical
-    interface and semantics. Uses back-to-back kernel execution to exploit
-    L2 cache warmth for the Y1 intermediate activation.
-
-    Performance characteristics (H100):
-    - L2 cache warmth: Phase 1 TMA store populates L2 with Y1 data.
-      Phase 2 TMA load hits L2 instead of cold HBM (~3.6x bandwidth).
-    - Launch overhead: Single custom_op eliminates Python/CUDA driver gap.
-    - Metadata sharing: Expert routing computed once, reused for both GEMMs.
-
-    Estimated speedup vs unfused baseline:
-    - Small configs (T≤4096, I≤4096): ~1-2% (Y1 fits in L2)
-    - Large configs (T>16384): ~0.5-1% (partial L2 hit)
-
-    Args:
-        x: Input hidden states (T, H)
-        router_w: Router weight matrix (E, H)
-        w1: Up-projection weights (2*I, H, E) for GLU
-        b1: Up-projection bias or None
-        w2: Down-projection weights (H, I, E)
-        b2: Down-projection bias or None
-        K: Number of experts per token
-        stream_id: CUDA stream ID
-        activation_type: Activation function
-        is_inference_mode_enabled: Whether in inference mode
-
-    Returns:
-        Tuple of (output, router_logits, expert_frequency)
-    """
+    """Forward pass with L2-cache-warm megakernel fusion and Token Rounding support."""
     import torch.nn.functional as F
 
     from ..count_cumsum import count_cumsum
@@ -602,45 +574,101 @@ def moe_megakernel_forward(
     E = router_w.size(0)
     T_tokens = x.size(0)
 
-    # ── Router (unchanged — compute-light, not worth fusing) ────────────
+    # ── Router (compute-light, not worth fusing) ────────────
     router_logits = F.linear(x, router_w)
 
-    from . import TC_Softmax_Topk_Router_Function
+    if routing == "top_k":
+        from . import TC_Softmax_Topk_Router_Function
+        topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(
+            router_logits, E, K
+        )
 
-    topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(
-        router_logits, E, K
-    )
+        T, K_actual = topk_indices.size()
+        TK = T * K_actual
+        device = topk_indices.device
 
-    T, K_actual = topk_indices.size()
-    TK = T * K_actual
-    device = topk_indices.device
+        # ── Token sorting ────────────
+        s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+        s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+        expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+        expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+        x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
-    # ── Token sorting (unchanged — Triton kernel, very fast) ────────────
-    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
-    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
-    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+        TC_topk_router_metadata_triton(
+            topk_indices,
+            E,
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+        )
+        
+        is_varlen_K = False
+        varlen_K_max = K_actual
+        num_activated_expert_per_token_offset = None
+        topk_scores_in = topk_scores
+        topk_indices_in = x_gather_idx # This is actually x_gather_idx, not topk_indices
+        
+    else:
+        # ── Token Rounding (TR) Implementation ─────────────────
+        from . import general_routing_router_metadata
+        dtype = x.dtype
+        device = x.device
+        
+        router_scores_full = F.softmax(router_logits, dim=-1, dtype=torch.float32).to(dtype)
+        topk_values, topk_indices_full = router_scores_full.topk(K, dim=-1)
 
-    TC_topk_router_metadata_triton(
-        topk_indices,
-        E,
-        expert_frequency,
-        expert_frequency_offset,
-        x_gather_idx,
-        s_scatter_idx,
-        s_reverse_scatter_idx,
-    )
+        expert_freq = count_cumsum(topk_indices_full.view(-1), E, do_cumsum=True)[0]
+        expert_freq_rounded_up = (torch.ceil(expert_freq / Mtile) * Mtile).type(torch.int32)
+        expert_freq_rounded_down = (expert_freq // Mtile) * Mtile
+
+        topk_values /= topk_values.sum(dim=-1, keepdim=True)
+        router_scores_full.scatter_(-1, topk_indices_full, topk_values)
+
+        router_TC_EC_combined_val = router_scores_full.detach().clone()
+        router_TC_EC_combined_val -= 1.0  
+        router_TC_EC_combined_val.scatter_(1, topk_indices_full, topk_values)  
+
+        topk_indices_sorted = router_TC_EC_combined_val.argsort(dim=0, descending=True).int()
+
+        if routing == "down":
+            expert_freq_rounded = expert_freq_rounded_down
+        elif routing == "up":
+            expert_freq_rounded = expert_freq_rounded_up
+        elif routing == "nr":
+            expert_freq_rounded = torch.round(expert_freq / Mtile).type(torch.int32) * Mtile
+        else:
+            raise NotImplementedError(f"Token rounding routing strategy '{routing}' is not implemented")
+
+        expert_freq_mask = torch.arange(T_tokens, device=device, dtype=torch.int32)[:, None].expand(-1, E) < expert_freq_rounded[None, :]
+
+        token_indices = topk_indices_sorted[expert_freq_mask]
+        expert_indices = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T_tokens, -1)[expert_freq_mask]
+
+        token_indices_order = token_indices.argsort().int()
+        token_indices = token_indices[token_indices_order]
+        expert_indices = expert_indices[token_indices_order]
+
+        topk_scores_flat = router_scores_full[token_indices, expert_indices].contiguous()
+
+        (
+            expert_frequency,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+        ) = general_routing_router_metadata(topk_scores_flat, token_indices, expert_indices, T_tokens, E)
+        
+        is_varlen_K = True
+        varlen_K_max = E
+        topk_scores_in = topk_scores_flat
+        topk_indices_in = x_gather_idx # This is actually x_gather_idx, not topk_indices
 
     # ── Fused up-proj + down-proj + aggregation ─────────────────────────
     o = _FusedMoEForward.apply(
         x, w1, b1, w2, b2,
-        topk_scores,
-        expert_frequency_offset,
-        T, K_actual, stream_id,
-        x_gather_idx,
-        s_scatter_idx,
-        s_reverse_scatter_idx,
         None,   # num_activated_expert_per_token_offset
         False,  # is_varlen_K
         activation_type,
