@@ -771,6 +771,9 @@ class HopperWgmma_MoE_kernel:
         mC_tensormap: Optional[cute.Tensor],
         mD_tensormap: Optional[cute.Tensor],
         mY_tensormap: Optional[cute.Tensor],
+        mW2: Optional[cute.Tensor],
+        mY2: Optional[cute.Tensor],
+        mB2: Optional[cute.Tensor],
         mTileCount_semaphore: Optional[cute.Pointer],
         mBatchIdx_schedule_order: Optional[cute.Tensor],
         max_active_clusters: Int32,
@@ -803,6 +806,15 @@ class HopperWgmma_MoE_kernel:
             self.y_layout = utils.LayoutEnum.from_tensor(mY)
         else:
             self.y_layout = self.y_dtype = None
+
+        if const_expr(self.fuse_down_projection):
+            assert mW2 is not None and mY2 is not None
+            self.w2_dtype = mW2.element_type
+            self.w2_layout = utils.LayoutEnum.from_tensor(mW2)
+            self.y2_dtype = mY2.element_type
+            self.y2_layout = utils.LayoutEnum.from_tensor(mY2)
+            self.tile_N2 = 128
+            self.tile_K2 = 128
 
         if const_expr(mC is not None):
             assert self.acc_dtype == cutlass.Float32
@@ -842,6 +854,18 @@ class HopperWgmma_MoE_kernel:
             self.atom_layout_mnk,
             tiler_mn=(64, self.tile_shape_mnk[1] // self.atom_layout_mnk[1]),
         )
+        if const_expr(self.fuse_down_projection):
+            tiled_mma_w2 = sm90_utils.make_trivial_tiled_mma(
+                self.y_dtype,  # sY acts as A
+                self.w2_dtype,
+                self.y_layout.sm90_mma_major_mode(),
+                self.w2_layout.sm90_mma_major_mode(),
+                self.acc_dtype,
+                self.atom_layout_mnk,
+                tiler_mn=(64, self.tile_N2 // self.atom_layout_mnk[1]),
+            )
+        else:
+            tiled_mma_w2 = None
         if const_expr(self.atom_layout_mnk[1] > 1):
             # If N dimension is split among 2 WGs, we need to permute the N dimension so
             # that in the epilogue, WG0 and WG1 can write to epi smem of size e.g. (64, 32)
@@ -934,6 +958,55 @@ class HopperWgmma_MoE_kernel:
             )
         else:
             tma_atom_y, tma_tensor_y = None, None
+
+        if const_expr(self.fuse_down_projection):
+            w2_b_is_k_major = self.w2_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
+            w2_b_smem_shape = (self.tile_N2, self.tile_K2)
+            w2_b_major_mode_size = self.tile_K2 if w2_b_is_k_major else self.tile_N2
+            w2_b_smem_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, w2_b_major_mode_size),
+                self.w2_dtype,
+            )
+            self.w2_stage = 1
+            self.w2_smem_layout_staged = cute.tile_to_shape(
+                w2_b_smem_layout_atom,
+                cute.append(w2_b_smem_shape, self.w2_stage),
+                order=(0, 1, 2) if w2_b_is_k_major else (1, 0, 2),
+            )
+            tma_atom_w2, tma_tensor_w2 = self._make_tma_atoms_and_tensors(
+                mW2, self.w2_smem_layout_staged, (self.tile_N2, self.tile_K2), self.cluster_shape_mnk[0]
+            )
+
+            y2_d_smem_shape = (self.tile_M, self.tile_N2)
+            y2_d_major_mode_size = self.tile_N2 if self.y2_layout.is_n_major_c() else self.tile_M
+            y2_d_smem_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(self.y2_layout, self.y2_dtype, y2_d_major_mode_size),
+                self.y2_dtype,
+            )
+            self.y2_epi_stage = 1
+            self.y2_epi_smem_layout_staged = cute.tile_to_shape(
+                y2_d_smem_layout_atom,
+                cute.append(y2_d_smem_shape, self.y2_epi_stage),
+                order=(1, 0, 2) if self.y2_layout.is_m_major_c() else (0, 1, 2)
+            )
+            tma_atom_y2, tma_tensor_y2 = self._make_tma_epi_atoms_and_tensors(
+                mY2, self.y2_epi_smem_layout_staged, y2_d_smem_shape, store_or_load="store"
+            )
+
+            # A2 (y1 input to WGMMA Phase 2) layout
+            a2_smem_shape = (self.tile_M, self.tile_K2)
+            # Force K-major layout for A operand of WGMMA
+            a2_smem_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(utils.LayoutEnum.K_Major, self.y_dtype, self.tile_K2),
+                self.y_dtype,
+            )
+            self.a2_smem_layout_staged = cute.tile_to_shape(
+                a2_smem_layout_atom,
+                cute.append(a2_smem_shape, 1),
+                order=(1, 0, 2) # (K-major)
+            )
+        else:
+            tma_atom_w2 = tma_tensor_w2 = tma_atom_y2 = tma_tensor_y2 = None
 
         if const_expr(self.compute_weight_gradient):
             assert const_expr(
@@ -1036,6 +1109,20 @@ class HopperWgmma_MoE_kernel:
                     cute.struct.MemRange[self.index_dtype, self.prefetch_token_idx_size],
                     self.buffer_align_bytes,
                 ]
+            if const_expr(self.fuse_down_projection):
+                sW2: cute.struct.Align[
+                    cute.struct.MemRange[self.w2_dtype, cute.cosize(self.w2_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sY2: cute.struct.Align[
+                    cute.struct.MemRange[self.y2_dtype, cute.cosize(self.y2_epi_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                sA2: cute.struct.Align[
+                    cute.struct.MemRange[self.y_dtype, cute.cosize(self.a2_smem_layout_staged)],
+                    self.buffer_align_bytes,
+                ]
+                w2_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
 
         self.shared_storage = SharedStorage
         allocated_smem_size = self.shared_storage.size_in_bytes() + self.tensormap_management_bytes
@@ -1071,7 +1158,14 @@ class HopperWgmma_MoE_kernel:
             mC_tensormap,
             mD_tensormap,
             mY_tensormap,
+            mW2,
+            tma_atom_w2,
+            tma_tensor_w2,
+            mY2,
+            tma_atom_y2,
+            tma_tensor_y2,
             tiled_mma,
+            tiled_mma_w2,
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
             self.b_smem_layout_staged,
@@ -1081,6 +1175,9 @@ class HopperWgmma_MoE_kernel:
             self.d_epi_smem_layout_staged,
             self.y_epi_smem_layout_staged,
             self.s_epi_smem_layout_staged,
+            self.w2_smem_layout_staged if self.fuse_down_projection else None,
+            self.y2_epi_smem_layout_staged if self.fuse_down_projection else None,
+            self.a2_smem_layout_staged if self.fuse_down_projection else None,
             tile_sched_params,
             TileScheduler,
         ).launch(
@@ -1394,7 +1491,14 @@ class HopperWgmma_MoE_kernel:
         mC_tensormap: Optional[cute.Tensor],
         mD_tensormap: cute.Tensor,
         mY_tensormap: Optional[cute.Tensor],
+        mW2: Optional[cute.Tensor],
+        tma_atom_w2: Optional[cute.CopyAtom],
+        tma_tensor_w2: Optional[cute.Tensor],
+        mY2: Optional[cute.Tensor],
+        tma_atom_y2: Optional[cute.CopyAtom],
+        tma_tensor_y2: Optional[cute.Tensor],
         tiled_mma: cute.TiledMma,
+        tiled_mma_w2: Optional[cute.TiledMma],
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
         b_smem_layout_staged: cute.ComposedLayout,
@@ -1404,6 +1508,9 @@ class HopperWgmma_MoE_kernel:
         d_epi_smem_layout_staged: cute.ComposedLayout,
         y_epi_smem_layout_staged: Optional[cute.ComposedLayout],
         s_epi_smem_layout_staged: Optional[cute.Layout],
+        w2_smem_layout_staged: Optional[cute.ComposedLayout],
+        y2_epi_smem_layout_staged: Optional[cute.ComposedLayout],
+        a2_smem_layout_staged: Optional[cute.ComposedLayout],
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
     ):
@@ -1421,6 +1528,9 @@ class HopperWgmma_MoE_kernel:
                 cpasync.prefetch_descriptor(tma_atom_y)
             if const_expr(tma_atom_c is not None):
                 cpasync.prefetch_descriptor(tma_atom_c)
+            if const_expr(self.fuse_down_projection):
+                cpasync.prefetch_descriptor(tma_atom_w2)
+                cpasync.prefetch_descriptor(tma_atom_y2)
 
         A_thr_copy_elems = self.universal_copy_bits // mA_mkl.element_type.width
 
@@ -1539,6 +1649,24 @@ class HopperWgmma_MoE_kernel:
             sBias = shared_storage.sBias.get_tensor(bias_epi_smem_layout_staged)
         else:
             sBias = None
+
+        if const_expr(self.fuse_down_projection):
+            sW2 = shared_storage.sW2.get_tensor(w2_smem_layout_staged.outer, swizzle=w2_smem_layout_staged.inner)
+            sY2 = shared_storage.sY2.get_tensor(y2_epi_smem_layout_staged.outer, swizzle=y2_epi_smem_layout_staged.inner)
+            sA2 = shared_storage.sA2.get_tensor(a2_smem_layout_staged.outer, swizzle=a2_smem_layout_staged.inner)
+            
+            w2_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            consumer_arrive_cnt = self.num_mma_threads // cute.arch.WARP_SIZE
+            w2_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, consumer_arrive_cnt)
+            w2_pipeline = pipeline.PipelineTmaAsync.create(
+                barrier_storage=shared_storage.w2_pipeline_array_ptr.data_ptr(),
+                num_stages=1,
+                producer_group=w2_pipeline_producer_group,
+                consumer_group=w2_pipeline_consumer_group,
+                tx_count=cute.size_in_bytes(self.w2_dtype, w2_smem_layout_staged.outer),
+            )
+        else:
+            sW2 = sY2 = sA2 = w2_pipeline = None
 
         sched_pipeline = None
         tile_count = None
@@ -2485,7 +2613,15 @@ class HopperWgmma_MoE_kernel:
 
                     if const_expr(not (self.inference_mode and self.need_adhoc_epilogue_store)):
                         cute.copy(tiled_copy_D_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)])
-                    if const_expr(self.need_adhoc_epilogue_store):
+                    if const_expr(self.fuse_down_projection):
+                        sA2_chunk = cute.local_tile(
+                            cute.domain_offset((0, const_expr(epi_idx * self.y_epi_tile[1]), 0), sA2),
+                            self.y_epi_tile,
+                            (0, 0)
+                        )
+                        tRS_sA2_chunk = tiled_copy_Y_r2s.get_slice(tidx).partition_D(sA2_chunk)
+                        cute.copy(tiled_copy_Y_r2s, tRS_rY, tRS_sA2_chunk)
+                    elif const_expr(self.need_adhoc_epilogue_store):
                         cute.copy(tiled_copy_Y_r2s, tRS_rY, tRS_sY[(None, None, None, epi_buffer)])
 
                     if const_expr(mDIdx_mnl is not None):
@@ -2542,6 +2678,67 @@ class HopperWgmma_MoE_kernel:
                             else:
                                 cute.arch.cp_async_bulk_wait_group(const_expr(self.d_epi_stage - 1), read=True)
 
+                        epilogue_barrier.arrive_and_wait()
+
+                if const_expr(self.fuse_down_projection):
+                    w2_n_tile_cnt = cute.ceil_div(mW2.shape[0], self.tile_N2)
+                    expert_idx = tile_coord_mnkl[-1]
+                    
+                    w2_producer_state = make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+                    w2_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+                    
+                    tCrA2 = tiled_mma_w2.get_slice(tidx).partition_A(sA2)
+                    tCrW2 = tiled_mma_w2.get_slice(tidx).partition_B(sW2)
+                    
+                    tRS_sY2 = tiled_copy_Y_r2s.get_slice(tidx).partition_D(sY2)
+
+                    y2_cta_layout = cute.make_layout((w2_n_tile_cnt, 1, mW2.shape[2]))
+                    w2_cta_layout = cute.make_layout((w2_n_tile_cnt, 1, mW2.shape[2]))
+                    
+                    for w2_n_idx in cutlass.range(w2_n_tile_cnt, unroll=1):
+                        b2_cta_crd = (w2_n_idx, 0, expert_idx)
+                        gW2_nk = cute.local_tile(tma_tensor_w2, (self.tile_N2, self.tile_K2), b2_cta_crd, proj=(None, 1, 1))
+                        tWsW, tWgW_nkl = cpasync.tma_partition(
+                            tma_atom_w2, b2_cta_crd[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk, 0, 2)
+                        )
+                        
+                        gY2_mn = cute.local_tile(tma_tensor_y2, (self.tile_M, self.tile_N2), (tile_coord_mnkl[0], w2_n_idx))
+                        tYsY, tYgY_mnl = cpasync.tma_partition(
+                            tma_atom_y2, 0, cute.make_layout(1), cute.group_modes(sY2, 0, 2), cute.group_modes(gY2_mn, 0, 2)
+                        )
+
+                        if is_tma_warp:
+                            w2_pipeline.producer_acquire(w2_producer_state)
+                            cute.copy(tma_atom_w2, tWgW_nkl[None, 0], tWsW[None, 0], tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state))
+                            w2_pipeline.producer_commit(w2_producer_state)
+                        w2_producer_state.advance()
+                        
+                        acc2_shape = tiled_mma_w2.get_slice(tidx).partition_C(
+                            cute.make_identity_tensor((self.tile_M, self.tile_N2))
+                        ).shape
+                        acc2 = cute.make_rmem_tensor(acc2_shape, self.acc_dtype)
+                        cute.clear(acc2)
+                        tiled_mma_w2.set(warpgroup.Field.ACCUMULATE, False)
+
+                        w2_pipeline.consumer_wait(w2_read_state)
+                        
+                        cute.gemm(tiled_mma_w2, acc2, tCrA2, tCrW2, acc2)
+                        
+                        w2_pipeline.consumer_release(w2_read_state)
+                        w2_read_state.advance()
+
+                        # Write acc2 to sY2
+                        for epi_v in cutlass.range_constexpr(cute.size(acc2)):
+                            tRS_rY[epi_v] = acc2[epi_v].to(self.y2_dtype)
+                        cute.copy(tiled_copy_Y_r2s, tRS_rY, tRS_sY2)
+                        
+                        cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                        epilogue_barrier.arrive_and_wait()
+                        
+                        if is_tma_warp:
+                            cute.copy(tma_atom_y2, tYsY[None, 0], tYgY_mnl[None, 0])
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
                         epilogue_barrier.arrive_and_wait()
 
                 if const_expr(self.compute_dz_and_partial_ds_and_y1s):

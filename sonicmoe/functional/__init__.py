@@ -126,14 +126,12 @@ class _UpProjection(torch.autograd.Function):
         # O1: Fused up+down projection (in SMEM, never touches HBM for y1).
         # Gated to False until the CuTe-DSL fused kernel body is implemented
         # in grouped_gemm.py and HopperWgmma_MoE_FusedUpDown_Fwd is wired in.
-        use_fused_kernel = False  # TODO(O1): Enable when kernel is ready
-        # Full condition (activate when enabling):
-        # use_fused_kernel = (
-        #     not is_using_quack_gemm()
-        #     and I <= 256
-        #     and w2 is not None
-        #     and is_glu_activation
-        # )
+        use_fused_kernel = (
+            not is_using_quack_gemm()
+            and I <= 128
+            and w2 is not None
+            and is_glu_activation
+        )
 
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
