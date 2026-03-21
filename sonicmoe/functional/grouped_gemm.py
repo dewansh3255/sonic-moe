@@ -2673,8 +2673,12 @@ class HopperWgmma_MoE_kernel:
             epi_bytes = d_bytes_per_stage * d_epi_stage
 
             if y_dtype is not None or const_expr(self.need_adhoc_epilogue_store):
-                y_bytes_per_stage = cute.size(y_epi_tile) * y_dtype.width // 8
-                epi_bytes += y_bytes_per_stage * y_epi_stage
+                # y_dtype may be None when fuse_down_projection=True (y1 stays in SMEM)
+                if y_dtype is not None:
+                    y_bytes_per_stage = cute.size(y_epi_tile) * y_dtype.width // 8
+                    epi_bytes += y_bytes_per_stage * y_epi_stage
+                else:
+                    y_bytes_per_stage = 0
             else:
                 y_bytes_per_stage = 0
 

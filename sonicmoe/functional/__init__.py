@@ -123,16 +123,17 @@ class _UpProjection(torch.autograd.Function):
             I //= 2
         TK = total_expert_freq
 
-        # Determine if fused kernel should be used:
-        # - n ≤ 256 (SMEM budget: y1 tile = 128 × 256 × 2B = 65KB fits in 227KB)
-        # - Not using QuACK GEMM (Blackwell path)
-        # - SwiGLU activation (extend to other GLU activations later)
-        use_fused_kernel = (
-            not is_using_quack_gemm()
-            and I <= 256
-            and w2 is not None
-            and is_glu_activation
-        )
+        # O1: Fused up+down projection (in SMEM, never touches HBM for y1).
+        # Gated to False until the CuTe-DSL fused kernel body is implemented
+        # in grouped_gemm.py and HopperWgmma_MoE_FusedUpDown_Fwd is wired in.
+        use_fused_kernel = False  # TODO(O1): Enable when kernel is ready
+        # Full condition (activate when enabling):
+        # use_fused_kernel = (
+        #     not is_using_quack_gemm()
+        #     and I <= 256
+        #     and w2 is not None
+        #     and is_glu_activation
+        # )
 
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
@@ -210,14 +211,16 @@ class _UpProjection(torch.autograd.Function):
             num_activated_expert_per_token_offset,
         )
 
-        if y1 is not None:
-            ctx.mark_non_differentiable(y1)
+        non_diff = [t for t in [y1, y2_fused] if t is not None]
+        if non_diff:
+            ctx.mark_non_differentiable(*non_diff)
         ctx.set_materialize_grads(False)
 
         return y1, z, y2_fused
 
     @staticmethod
-    def backward(ctx, _: None, dz: torch.Tensor):
+    def backward(ctx, _: None, dz: torch.Tensor, _dy2_fused: None):
+        """_dy2_fused is always None (y2_fused is marked non-differentiable)."""
         is_compiling = torch.compiler.is_compiling()
 
         if not is_compiling:
