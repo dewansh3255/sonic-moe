@@ -334,23 +334,28 @@ class HopperWgmma_MoE_FusedUpDown_Fwd:
             mW1,
             None,  # mC (not used in forward)
             mB1,
-            mZ,
+            mZ,    # mD
             None,  # mY1 — stays in SMEM, never written to HBM
             None,  # mS (not used)
             None,  # mDS_partial (not used)
             mE_offset,
             mX_gather,
-            mW2,         # additional: W2 weights for Phase 2
-            mY2,         # additional: y2 output tensor
-            mB2,         # additional: W2 bias
-            mY2_tensormap,  # additional: TMA descriptor for y2
-            mW2_tensormap,  # additional: TMA descriptor for W2
-            mD_tensormap,   # z TMA descriptor
-            mZ_tensormap,   # z TMA descriptor (second)
-            None,
+            None,  # mDIdx
+            None,  # mS_scatter_idx
+            None,  # mA_tensormap
+            None,  # mB_tensormap
+            None,  # mC_tensormap
+            mD_tensormap,
+            None,  # mY_tensormap (y1 output is fused)
+            None,  # semaphore
             mE_permute_order,
             const_expr(self.max_active_clusters),
             stream,
+            mW2,
+            mY2,
+            mB2,
+            mY2_tensormap,
+            mW2_tensormap,
         )
 
 

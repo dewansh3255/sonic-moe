@@ -771,13 +771,15 @@ class HopperWgmma_MoE_kernel:
         mC_tensormap: Optional[cute.Tensor],
         mD_tensormap: Optional[cute.Tensor],
         mY_tensormap: Optional[cute.Tensor],
-        mW2: Optional[cute.Tensor],
-        mY2: Optional[cute.Tensor],
-        mB2: Optional[cute.Tensor],
         mTileCount_semaphore: Optional[cute.Pointer],
         mBatchIdx_schedule_order: Optional[cute.Tensor],
         max_active_clusters: Int32,
         stream: cuda.CUstream,
+        mW2: Optional[cute.Tensor] = None,
+        mY2: Optional[cute.Tensor] = None,
+        mB2: Optional[cute.Tensor] = None,
+        mY2_tensormap: Optional[cute.Tensor] = None,
+        mW2_tensormap: Optional[cute.Tensor] = None,
     ):
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
