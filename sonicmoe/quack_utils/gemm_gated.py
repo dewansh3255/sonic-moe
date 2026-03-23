@@ -149,6 +149,7 @@ def gemm_gated(
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    use_2cta_mma: bool = False,
 ) -> None:
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
@@ -271,12 +272,17 @@ def gemm_gated(
     if compile_key not in cache:
         if device_capacity[0] == 9:
             GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+        kwargs = {}
+        if device_capacity[0] >= 10:
+            kwargs["use_2cta_mma"] = use_2cta_mma
+            
         gemm_obj = GemmCls(
             acc_dtype,
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
             gather_A=gather_A,
+            **kwargs
         )
         cache[compile_key] = cute.compile(
             gemm_obj,

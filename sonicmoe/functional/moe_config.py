@@ -359,6 +359,17 @@ class HopperWgmma_MoE_FusedUpDown_Fwd:
         )
 
 
+class Blackwell_MoE_FusedUpDown_Fwd:
+    """
+    Optimization O6 scaffolding: Blackwell TMEM A-Tensor Fusion.
+    Once Blackwell hardware is available, this should wrap a new kernel (e.g. `BlackwellUmma_MoE_kernel`)
+    that utilizes `tcgen05.mma` to keep the H accumulator and SwiGLU activation entirely in TMEM.
+    This expands the fusion budget from n<=256 up to n<=2048.
+    """
+    def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False):
+        raise NotImplementedError("Blackwell TMEM Fusion (O6) pending tcgen05.mma integration.")
+
+
 class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
     def __init__(self, E: int, H: int, I: int, activation_type: ActivationType):
         super().__init__()

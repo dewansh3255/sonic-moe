@@ -334,7 +334,19 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             TK = y1.size(0)
             assert b2 is None
-            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+            
+            kwargs = {}
+            # O5: 2-CTA Down-Projection
+            from quack.cute_dsl_utils import get_device_capacity
+            if get_device_capacity(y1.device)[0] >= 10:
+                from quack.gemm_config import GemmConfig
+                kwargs["config"] = GemmConfig(
+                    tile_m=128, tile_n=128, tile_k=64,
+                    cluster_m=1, cluster_n=2,
+                    use_2cta_mma=True
+                )
+                
+            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset, **kwargs)
         else:
             TK = y1.size(0)
             y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
