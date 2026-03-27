@@ -128,7 +128,7 @@ class _UpProjection(torch.autograd.Function):
         # in grouped_gemm.py and HopperWgmma_MoE_FusedUpDown_Fwd is wired in.
         use_fused_kernel = (
             not is_using_quack_gemm()
-            and I <= 128
+            and I <= 256
             and w2 is not None
             and is_glu_activation
         )
@@ -334,7 +334,20 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             TK = y1.size(0)
             assert b2 is None
-            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+            # O5: Use 2-CTA MMA on Blackwell for down-projection
+            kwargs = {}
+            major, minor = torch.cuda.get_device_capability()
+            if major >= 10:
+                try:
+                    from quack.gemm_config import GemmConfig
+                    kwargs["config"] = GemmConfig(
+                        tile_m=128, tile_n=128, tile_k=64,
+                        cluster_m=1, cluster_n=2,
+                        use_2cta_mma=True,
+                    )
+                except (ImportError, TypeError):
+                    pass  # quack version doesn't support 2-CTA config yet
+            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset, **kwargs)
         else:
             TK = y1.size(0)
             y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)

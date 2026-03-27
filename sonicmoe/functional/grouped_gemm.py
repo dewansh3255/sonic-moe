@@ -969,7 +969,7 @@ class HopperWgmma_MoE_kernel:
                 sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, w2_b_major_mode_size),
                 self.w2_dtype,
             )
-            self.w2_stage = 1
+            self.w2_stage = 2
             self.w2_smem_layout_staged = cute.tile_to_shape(
                 w2_b_smem_layout_atom,
                 cute.append(w2_b_smem_shape, self.w2_stage),
@@ -1662,7 +1662,7 @@ class HopperWgmma_MoE_kernel:
             w2_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, consumer_arrive_cnt)
             w2_pipeline = pipeline.PipelineTmaAsync.create(
                 barrier_storage=shared_storage.w2_pipeline_array_ptr.data_ptr(),
-                num_stages=1,
+                num_stages=2,
                 producer_group=w2_pipeline_producer_group,
                 consumer_group=w2_pipeline_consumer_group,
                 tx_count=cute.size_in_bytes(self.w2_dtype, w2_smem_layout_staged.outer),
@@ -2686,8 +2686,8 @@ class HopperWgmma_MoE_kernel:
                     w2_n_tile_cnt = cute.ceil_div(mW2.shape[0], self.tile_N2)
                     expert_idx = tile_coord_mnkl[-1]
                     
-                    w2_producer_state = make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-                    w2_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+                    w2_producer_state = make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
+                    w2_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
                     
                     tCrA2 = tiled_mma_w2.get_slice(tidx).partition_A(sA2)
                     tCrW2 = tiled_mma_w2.get_slice(tidx).partition_B(sW2)
@@ -2696,25 +2696,35 @@ class HopperWgmma_MoE_kernel:
 
                     y2_cta_layout = cute.make_layout((w2_n_tile_cnt, 1, mW2.shape[2]))
                     w2_cta_layout = cute.make_layout((w2_n_tile_cnt, 1, mW2.shape[2]))
+
+                    # === O3: Pre-load first W2 tile before the compute loop ===
+                    b2_cta_crd_0 = (0, 0, expert_idx)
+                    gW2_nk_0 = cute.local_tile(tma_tensor_w2, (self.tile_N2, self.tile_K2), b2_cta_crd_0, proj=(None, 1, 1))
+                    tWsW_0, tWgW_nkl_0 = cpasync.tma_partition(
+                        tma_atom_w2, b2_cta_crd_0[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_0, 0, 2)
+                    )
+                    if is_tma_warp:
+                        w2_pipeline.producer_acquire(w2_producer_state)
+                        cute.copy(tma_atom_w2, tWgW_nkl_0[None, 0], tWsW_0[None, w2_producer_state.index], tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state))
+                        w2_pipeline.producer_commit(w2_producer_state)
+                    w2_producer_state.advance()
                     
                     for w2_n_idx in cutlass.range(w2_n_tile_cnt, unroll=1):
-                        b2_cta_crd = (w2_n_idx, 0, expert_idx)
-                        gW2_nk = cute.local_tile(tma_tensor_w2, (self.tile_N2, self.tile_K2), b2_cta_crd, proj=(None, 1, 1))
-                        tWsW, tWgW_nkl = cpasync.tma_partition(
-                            tma_atom_w2, b2_cta_crd[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk, 0, 2)
-                        )
-                        
-                        gY2_mn = cute.local_tile(tma_tensor_y2, (self.tile_M, self.tile_N2), (tile_coord_mnkl[0], w2_n_idx))
-                        tYsY, tYgY_mnl = cpasync.tma_partition(
-                            tma_atom_y2, 0, cute.make_layout(1), cute.group_modes(sY2, 0, 2), cute.group_modes(gY2_mn, 0, 2)
-                        )
+                        # --- Prefetch next W2 tile (overlaps with WGMMA below) ---
+                        next_w2_n_idx = w2_n_idx + 1
+                        if next_w2_n_idx < w2_n_tile_cnt:
+                            b2_cta_crd_next = (next_w2_n_idx, 0, expert_idx)
+                            gW2_nk_next = cute.local_tile(tma_tensor_w2, (self.tile_N2, self.tile_K2), b2_cta_crd_next, proj=(None, 1, 1))
+                            tWsW_next, tWgW_nkl_next = cpasync.tma_partition(
+                                tma_atom_w2, b2_cta_crd_next[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_next, 0, 2)
+                            )
+                            if is_tma_warp:
+                                w2_pipeline.producer_acquire(w2_producer_state)
+                                cute.copy(tma_atom_w2, tWgW_nkl_next[None, 0], tWsW_next[None, w2_producer_state.index], tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state))
+                                w2_pipeline.producer_commit(w2_producer_state)
+                            w2_producer_state.advance()
 
-                        if is_tma_warp:
-                            w2_pipeline.producer_acquire(w2_producer_state)
-                            cute.copy(tma_atom_w2, tWgW_nkl[None, 0], tWsW[None, 0], tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state))
-                            w2_pipeline.producer_commit(w2_producer_state)
-                        w2_producer_state.advance()
-                        
+                        # --- Compute current tile ---
                         acc2_shape = tiled_mma_w2.get_slice(tidx).partition_C(
                             cute.make_identity_tensor((self.tile_M, self.tile_N2))
                         ).shape
@@ -2724,12 +2734,12 @@ class HopperWgmma_MoE_kernel:
 
                         w2_pipeline.consumer_wait(w2_read_state)
                         
-                        cute.gemm(tiled_mma_w2, acc2, tCrA2, tCrW2, acc2)
+                        cute.gemm(tiled_mma_w2, acc2, tCrA2, tCrW2[None, None, w2_read_state.index], acc2)
                         
                         w2_pipeline.consumer_release(w2_read_state)
                         w2_read_state.advance()
 
-                        # Write acc2 to sY2
+                        # --- Epilogue: store y2 tile to HBM ---
                         for epi_v in cutlass.range_constexpr(cute.size(acc2)):
                             tRS_rY[epi_v] = acc2[epi_v].to(self.y2_dtype)
                         cute.copy(tiled_copy_Y_r2s, tRS_rY, tRS_sY2)
@@ -2737,6 +2747,10 @@ class HopperWgmma_MoE_kernel:
                         cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
                         epilogue_barrier.arrive_and_wait()
                         
+                        gY2_mn = cute.local_tile(tma_tensor_y2, (self.tile_M, self.tile_N2), (tile_coord_mnkl[0], w2_n_idx))
+                        tYsY, tYgY_mnl = cpasync.tma_partition(
+                            tma_atom_y2, 0, cute.make_layout(1), cute.group_modes(sY2, 0, 2), cute.group_modes(gY2_mn, 0, 2)
+                        )
                         if is_tma_warp:
                             cute.copy(tma_atom_y2, tYsY[None, 0], tYgY_mnl[None, 0])
                             cute.arch.cp_async_bulk_commit_group()
