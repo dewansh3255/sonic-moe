@@ -2704,7 +2704,7 @@ class HopperWgmma_MoE_kernel:
                     w2_tile_shape = (self.tile_M, self.tile_N2, self.tile_K2)
 
                     # === O3: Pre-load first W2 tile before the compute loop ===
-                    w2_coord_0 = (0, 0, 0, expert_idx)
+                    w2_coord_0 = (0, 0, None, expert_idx)
                     gW2_nk_0 = cute.local_tile(tma_tensor_w2, w2_tile_shape, w2_coord_0, proj=(None, 1, 1))
                     tWsW_0, tWgW_nkl_0 = cpasync.tma_partition(
                         tma_atom_w2, cluster_coord_mnk[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_0, 0, 2)
@@ -2719,7 +2719,7 @@ class HopperWgmma_MoE_kernel:
                         # --- Prefetch next W2 tile (overlaps with WGMMA below) ---
                         next_w2_n_idx = w2_n_idx + 1
                         if next_w2_n_idx < w2_n_tile_cnt:
-                            w2_coord_next = (0, next_w2_n_idx, 0, expert_idx)
+                            w2_coord_next = (0, next_w2_n_idx, None, expert_idx)
                             gW2_nk_next = cute.local_tile(tma_tensor_w2, w2_tile_shape, w2_coord_next, proj=(None, 1, 1))
                             tWsW_next, tWgW_nkl_next = cpasync.tma_partition(
                                 tma_atom_w2, cluster_coord_mnk[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_next, 0, 2)
