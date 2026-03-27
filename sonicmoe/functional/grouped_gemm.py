@@ -803,9 +803,14 @@ class HopperWgmma_MoE_kernel:
             self.bias_layout = None
 
         # If fuse_down_projection is True, we don't store mY to HBM, so mY is None.
+        # However the SwiGLU epilogue still needs y_dtype/y_layout for register
+        # conversions and SMEM layout computation — derive from mA (same dtype/layout as y1).
         if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
             self.y_dtype = mY.element_type
             self.y_layout = utils.LayoutEnum.from_tensor(mY)
+        elif const_expr(self.fuse_down_projection and (self.is_glu or self.is_normal_act)):
+            self.y_dtype = mA.element_type
+            self.y_layout = self.a_layout
         else:
             self.y_layout = self.y_dtype = None
 
