@@ -2700,12 +2700,13 @@ class HopperWgmma_MoE_kernel:
 
                     y2_cta_layout = cute.make_layout((w2_n_tile_cnt, 1, mW2.shape[2]))
                     w2_cta_layout = cute.make_layout((w2_n_tile_cnt, 1, mW2.shape[2]))
+                    w2_tile_shape = (self.tile_M, self.tile_N2, self.tile_K2)
 
                     # === O3: Pre-load first W2 tile before the compute loop ===
-                    b2_cta_crd_0 = (0, 0, expert_idx)
-                    gW2_nk_0 = cute.local_tile(tma_tensor_w2, (self.tile_N2, self.tile_K2), b2_cta_crd_0, proj=(None, 1, 1))
+                    w2_coord_0 = (0, 0, 0, expert_idx)
+                    gW2_nk_0 = cute.local_tile(tma_tensor_w2, w2_tile_shape, w2_coord_0, proj=(None, 1, 1))
                     tWsW_0, tWgW_nkl_0 = cpasync.tma_partition(
-                        tma_atom_w2, b2_cta_crd_0[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_0, 0, 2)
+                        tma_atom_w2, 0, w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_0, 0, 2)
                     )
                     if is_tma_warp:
                         w2_pipeline.producer_acquire(w2_producer_state)
@@ -2717,10 +2718,10 @@ class HopperWgmma_MoE_kernel:
                         # --- Prefetch next W2 tile (overlaps with WGMMA below) ---
                         next_w2_n_idx = w2_n_idx + 1
                         if next_w2_n_idx < w2_n_tile_cnt:
-                            b2_cta_crd_next = (next_w2_n_idx, 0, expert_idx)
-                            gW2_nk_next = cute.local_tile(tma_tensor_w2, (self.tile_N2, self.tile_K2), b2_cta_crd_next, proj=(None, 1, 1))
+                            w2_coord_next = (0, next_w2_n_idx, 0, expert_idx)
+                            gW2_nk_next = cute.local_tile(tma_tensor_w2, w2_tile_shape, w2_coord_next, proj=(None, 1, 1))
                             tWsW_next, tWgW_nkl_next = cpasync.tma_partition(
-                                tma_atom_w2, b2_cta_crd_next[0], w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_next, 0, 2)
+                                tma_atom_w2, next_w2_n_idx, w2_cta_layout, cute.group_modes(sW2, 0, 2), cute.group_modes(gW2_nk_next, 0, 2)
                             )
                             if is_tma_warp:
                                 w2_pipeline.producer_acquire(w2_producer_state)
