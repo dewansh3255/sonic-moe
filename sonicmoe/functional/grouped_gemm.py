@@ -1000,17 +1000,18 @@ class HopperWgmma_MoE_kernel:
                 mY2, self.y2_epi_smem_layout_staged, y2_d_smem_shape, store_or_load="store"
             )
 
-            # A2 (y1 input to WGMMA Phase 2) layout
+            # A2 (y1 input to WGMMA Phase 2) layout — use same layout as input A (X tensor)
             a2_smem_shape = (self.tile_M, self.tile_K2)
-            # Force K-major layout for A operand of WGMMA
+            a2_is_k_major = self.a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
+            a2_major_mode_size = self.tile_K2 if a2_is_k_major else self.tile_M
             a2_smem_layout_atom = warpgroup.make_smem_layout_atom(
-                sm90_utils.get_smem_layout_atom(utils.LayoutEnum.K_Major, self.y_dtype, self.tile_K2),
+                sm90_utils.get_smem_layout_atom(self.a_layout, self.y_dtype, a2_major_mode_size),
                 self.y_dtype,
             )
             self.a2_smem_layout_staged = cute.tile_to_shape(
                 a2_smem_layout_atom,
                 cute.append(a2_smem_shape, 1),
-                order=(1, 0, 2) # (K-major)
+                order=(0, 1, 2) if a2_is_k_major else (1, 0, 2),
             )
         else:
             tma_atom_w2 = tma_tensor_w2 = tma_atom_y2 = tma_tensor_y2 = None
