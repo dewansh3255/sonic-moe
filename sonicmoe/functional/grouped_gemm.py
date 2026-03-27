@@ -2702,6 +2702,8 @@ class HopperWgmma_MoE_kernel:
                     cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()))
                     w2_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
                     w2_tile_shape = (self.tile_M, self.tile_N2, self.tile_K2)
+                    w2_mcast_mask = cute.make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=0)
+                    w2_mcast_mask = w2_mcast_mask if self.cluster_shape_mnk[0] > 1 else 0
 
                     # === O3: Pre-load first W2 tile before the compute loop ===
                     w2_coord_0 = (0, 0, None, expert_idx)
@@ -2711,7 +2713,13 @@ class HopperWgmma_MoE_kernel:
                     )
                     if is_tma_warp:
                         w2_pipeline.producer_acquire(w2_producer_state)
-                        cute.copy(tma_atom_w2, tWgW_nkl_0[None, 0], tWsW_0[None, w2_producer_state.index], tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state))
+                        cute.copy(
+                            tma_atom_w2, 
+                            tWgW_nkl_0[None, 0], 
+                            tWsW_0[None, w2_producer_state.index], 
+                            tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state),
+                            mcast_mask=w2_mcast_mask
+                        )
                         w2_pipeline.producer_commit(w2_producer_state)
                     w2_producer_state.advance()
                     
@@ -2726,7 +2734,13 @@ class HopperWgmma_MoE_kernel:
                             )
                             if is_tma_warp:
                                 w2_pipeline.producer_acquire(w2_producer_state)
-                                cute.copy(tma_atom_w2, tWgW_nkl_next[None, 0], tWsW_next[None, w2_producer_state.index], tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state))
+                                cute.copy(
+                                    tma_atom_w2, 
+                                    tWgW_nkl_next[None, 0], 
+                                    tWsW_next[None, w2_producer_state.index], 
+                                    tma_bar_ptr=w2_pipeline.producer_get_barrier(w2_producer_state),
+                                    mcast_mask=w2_mcast_mask
+                                )
                                 w2_pipeline.producer_commit(w2_producer_state)
                             w2_producer_state.advance()
 
