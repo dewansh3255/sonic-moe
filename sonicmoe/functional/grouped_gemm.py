@@ -2698,8 +2698,8 @@ class HopperWgmma_MoE_kernel:
                     
                     tRS_sY2 = tiled_copy_Y_r2s.get_slice(tidx).partition_D(sY2)
 
-                    # w2_cta_layout must be the cluster layout for TMA multicast (same as W1)
                     # W2 is multicast across the M-cluster dimension.
+                    cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()))
                     w2_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (None, 0, 0)).shape)
                     w2_tile_shape = (self.tile_M, self.tile_N2, self.tile_K2)
 
