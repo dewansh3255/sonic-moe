@@ -2749,7 +2749,7 @@ class HopperWgmma_MoE_kernel:
                             cute.make_identity_tensor((self.tile_M, self.tile_N2))
                         ).shape
                         acc2 = cute.make_rmem_tensor(acc2_shape, self.acc_dtype)
-                        cute.clear(acc2)
+                        acc2.fill(0.0)
                         tiled_mma_w2.set(warpgroup.Field.ACCUMULATE, False)
 
                         w2_pipeline.consumer_wait(w2_read_state)
