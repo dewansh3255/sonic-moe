@@ -2618,8 +2618,10 @@ class HopperWgmma_MoE_kernel:
                     if const_expr(not (self.inference_mode and self.need_adhoc_epilogue_store)):
                         cute.copy(tiled_copy_D_r2s, tRS_rD_out, tRS_sD[(None, None, None, epi_buffer)])
                     if const_expr(self.fuse_down_projection):
+                        # sA2 is 3D (M, K2, stages=1); slice off stage dim for 2D local_tile
+                        sA2_2d = sA2[None, None, 0]
                         sA2_chunk = cute.local_tile(
-                            cute.domain_offset((0, const_expr(epi_idx * self.y_epi_tile[1]), 0), sA2),
+                            cute.domain_offset((0, const_expr(epi_idx * self.y_epi_tile[1])), sA2_2d),
                             self.y_epi_tile,
                             (0, 0)
                         )
