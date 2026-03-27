@@ -132,6 +132,7 @@ class _UpProjection(torch.autograd.Function):
             and w2 is not None
             and is_glu_activation
         )
+        print(f"[DEBUG] use_fused={use_fused_kernel}, I={I}")
 
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
