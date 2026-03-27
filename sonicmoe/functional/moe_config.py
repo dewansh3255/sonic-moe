@@ -325,8 +325,8 @@ class HopperWgmma_MoE_FusedUpDown_Fwd:
 
     @cute.jit
     def __call__(
-        self, mX, mW1, mW2, mZ, mY2, mB1, mB2,
-        mE_offset, mX_gather, mD_tensormap, mZ_tensormap, mY2_tensormap,
+        self, mX, mW1, mW2, mZ, mY2, mY1_dummy, mB1, mB2,
+        mE_offset, mX_gather, mD_tensormap, mY_tensormap, mZ_tensormap, mY2_tensormap,
         mW2_tensormap, mE_permute_order, stream
     ):
         return self.module(
@@ -335,7 +335,7 @@ class HopperWgmma_MoE_FusedUpDown_Fwd:
             None,  # mC (not used in forward)
             mB1,
             mZ,    # mD
-            None,  # mY1 — stays in SMEM, never written to HBM
+            mY1_dummy,  # mY — dummy tensor for TMA infrastructure; actual y1 goes to sA2
             None,  # mS (not used)
             None,  # mDS_partial (not used)
             mE_offset,
@@ -346,7 +346,7 @@ class HopperWgmma_MoE_FusedUpDown_Fwd:
             None,  # mB_tensormap
             None,  # mC_tensormap
             mD_tensormap,
-            None,  # mY_tensormap (y1 output is fused)
+            mY_tensormap,  # tensormap for dummy y1 (needed for TMA descriptor init)
             None,  # semaphore
             mE_permute_order,
             const_expr(self.max_active_clusters),

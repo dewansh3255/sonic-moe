@@ -802,15 +802,11 @@ class HopperWgmma_MoE_kernel:
             self.bias_dtype = None
             self.bias_layout = None
 
-        # If fuse_down_projection is True, we don't store mY to HBM, so mY is None.
-        # However the SwiGLU epilogue still needs y_dtype/y_layout for register
-        # conversions and SMEM layout computation — derive from mA (same dtype/layout as y1).
-        if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+        # If fuse_down_projection is True, y1 goes to sA2 in SMEM. We still need
+        # y_dtype/y_layout for the TMA infrastructure (a dummy mY tensor is provided).
+        if const_expr(self.need_adhoc_epilogue_store):
             self.y_dtype = mY.element_type
             self.y_layout = utils.LayoutEnum.from_tensor(mY)
-        elif const_expr(self.fuse_down_projection and (self.is_glu or self.is_normal_act)):
-            self.y_dtype = mA.element_type
-            self.y_layout = self.a_layout
         else:
             self.y_layout = self.y_dtype = None
 
@@ -959,7 +955,7 @@ class HopperWgmma_MoE_kernel:
         else:
             D_tiled_copy = None
 
-        if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+        if const_expr(self.need_adhoc_epilogue_store):
             tma_atom_y, tma_tensor_y = self._make_tma_epi_atoms_and_tensors(
                 mY, self.y_epi_smem_layout_staged, self.y_epi_tile, store_or_load="store"
             )
@@ -1532,7 +1528,7 @@ class HopperWgmma_MoE_kernel:
             cpasync.prefetch_descriptor(tma_atom_b)
             if const_expr(not self.inference_mode):
                 cpasync.prefetch_descriptor(tma_atom_d)
-            if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+            if const_expr(self.need_adhoc_epilogue_store):
                 cpasync.prefetch_descriptor(tma_atom_y)
             if const_expr(tma_atom_c is not None):
                 cpasync.prefetch_descriptor(tma_atom_c)
@@ -1784,7 +1780,7 @@ class HopperWgmma_MoE_kernel:
             else:
                 d_tensormap_ptr = None
 
-            if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+            if const_expr(self.need_adhoc_epilogue_store):
                 assert mY_tensormap is not None
                 y_tensormap_ptr = tensormap_manager.get_tensormap_ptr(
                     mY_tensormap[tensormap_workspace_idx, None].iterator
@@ -2100,7 +2096,7 @@ class HopperWgmma_MoE_kernel:
                         tensormap_d_init_ptr,
                         is_manager_warp=is_tma_warp,
                     )
-                if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+                if const_expr(self.need_adhoc_epilogue_store):
                     tensormap_manager.init_tensormap_from_atom(
                         tma_atom_y,
                         tensormap_y_init_ptr,
@@ -2198,7 +2194,7 @@ class HopperWgmma_MoE_kernel:
                                 tensormap_smem_ptr=d_tensormap_smem_ptr,
                                 # cute.AddressSpace.generic
                             )
-                        if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+                        if const_expr(self.need_adhoc_epilogue_store):
                             assert y_tensormap_smem_ptr is not None and y_tensormap_ptr is not None
                             self.update_tma_desc_ptr(
                                 mY_mnl,
@@ -2395,7 +2391,7 @@ class HopperWgmma_MoE_kernel:
                         tdgd_for_tma_partition,
                     )
 
-                if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+                if const_expr(self.need_adhoc_epilogue_store):
                     bSG_sY, bSG_gY = cpasync.tma_partition(
                         tma_atom_y,
                         0,
@@ -2484,13 +2480,11 @@ class HopperWgmma_MoE_kernel:
                             d_tensormap_ptr,
                             cute.AddressSpace.generic,
                         )
-                    if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+                    if const_expr(self.need_adhoc_epilogue_store):
                         y_tma_desc_ptr = tensormap_manager.get_tensormap_ptr(
                             y_tensormap_ptr,
                             cute.AddressSpace.generic,
                         )
-                    else:
-                        y_tma_desc_ptr = None
                     if const_expr(self.need_epilogue_load):
                         c_tma_desc_ptr = tensormap_manager.get_tensormap_ptr(
                             c_tensormap_ptr,
@@ -2675,7 +2669,7 @@ class HopperWgmma_MoE_kernel:
                                     bSG_gD[None, gmem_coord],
                                     tma_desc_ptr=d_tma_desc_ptr,
                                 )
-                            if const_expr(self.need_adhoc_epilogue_store and not self.fuse_down_projection):
+                            if const_expr(self.need_adhoc_epilogue_store):
                                 cute.copy(
                                     tma_atom_y,
                                     bSG_sY[None, epi_buffer],

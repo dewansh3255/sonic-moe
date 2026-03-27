@@ -235,6 +235,14 @@ def _fused_up_down_projection_forward(
     else:
         mB2 = convert_torch_tensor_to_cute_tensor(b2.detach(), (0, 1), 1, 16, 8, stream=stream_id)
 
+    # Create a dummy y1 tensor for TMA infrastructure.
+    # The fused kernel writes actual y1 to sA2 (SMEM), but the kernel's
+    # TMA epilogue code still references mY for tensormap/descriptor setup.
+    # This dummy receives harmless TMA writes that we discard.
+    TK = z.size(0)
+    y1_dummy = torch.empty(TK, I, dtype=x.dtype, device=x.device)
+    mY1_dummy = convert_torch_tensor_to_cute_tensor(y1_dummy, (0, 1), 1, 16, 8, stream=stream_id)
+
     current_stream = cuda.CUstream(stream_id)
 
     compile_key = (E, H, I, H_w2, (b1 is None), (b2 is None), x.dtype, activation_type, is_inference_mode_enabled)
@@ -242,13 +250,13 @@ def _fused_up_down_projection_forward(
         fused_module = HopperWgmma_MoE_FusedUpDown_Fwd(
             E, H, I, activation_type=ActivationType(activation_type), inference_mode=is_inference_mode_enabled
         )
-        # Generate tensormaps: z (up-proj D output), y2 (down-proj D output), W2 (down-proj B input)
-        tensormaps = [fused_module.module.generate_tensormap(None, None, None) for _ in range(4)]
+        # Generate tensormaps: z (D output), y1_dummy (Y output), y2 (down-proj D), W2 (down-proj B), extra
+        tensormaps = [fused_module.module.generate_tensormap(None, None, None) for _ in range(5)]
         _fused_up_down_projection_forward.compile_cache[compile_key] = cute.compile(
             fused_module,
-            mX, mW1, mW2, mZ, mY2, mB1, mB2,
+            mX, mW1, mW2, mZ, mY2, mY1_dummy, mB1, mB2,
             mE_offset, mX_gather,
-            tensormaps[0], tensormaps[1], tensormaps[2], tensormaps[3],
+            tensormaps[0], tensormaps[1], tensormaps[2], tensormaps[3], tensormaps[4],
             mE_permute_order,
             current_stream,
         )
@@ -256,9 +264,9 @@ def _fused_up_down_projection_forward(
 
     fused_tensormaps = _fused_up_down_projection_forward.compile_cache[FUSED_TENSORMAP]
     _fused_up_down_projection_forward.compile_cache[compile_key](
-        mX, mW1, mW2, mZ, mY2, mB1, mB2,
+        mX, mW1, mW2, mZ, mY2, mY1_dummy, mB1, mB2,
         mE_offset, mX_gather,
-        fused_tensormaps[0], fused_tensormaps[1], fused_tensormaps[2], fused_tensormaps[3],
+        fused_tensormaps[0], fused_tensormaps[1], fused_tensormaps[2], fused_tensormaps[3], fused_tensormaps[4],
         mE_permute_order,
         current_stream,
     )
