@@ -2693,7 +2693,9 @@ class HopperWgmma_MoE_kernel:
                     w2_producer_state = make_pipeline_state(pipeline.PipelineUserType.Producer, 2)
                     w2_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
                     
-                    tCrA2 = tiled_mma_w2.get_slice(tidx).partition_A(sA2)
+                    # sA2 has shape (tile_M, tile_K2, 1) — slice stage dim first to get 2D tile
+                    # so partition_A returns rank-2 matching partition_B of the 2D sW2 stage-slice
+                    tCrA2 = tiled_mma_w2.get_slice(tidx).partition_A(sA2[None, None, 0])
                     # tCrW2 is partitioned per-stage inside the loop to avoid rank mismatch
                     
                     tRS_sY2 = tiled_copy_Y_r2s.get_slice(tidx).partition_D(sY2)
