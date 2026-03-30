@@ -2768,6 +2768,17 @@ class HopperWgmma_MoE_kernel:
                         w2_read_state.advance()
 
                         # --- Epilogue: store y2 tile to HBM ---
+                        # Use same pattern as D epilogue: zipped_divide GMEM then tma_partition
+                        gY2_mn = cute.local_tile(tma_tensor_y2, (self.tile_M, self.tile_N2), (tile_coord_mnkl[0], w2_n_idx))
+                        tygY2_for_tma = cute.zipped_divide(gY2_mn, (self.tile_M, self.tile_N2))
+                        bSG_sY2, bSG_gY2 = cpasync.tma_partition(
+                            tma_atom_y2,
+                            0,
+                            cute.make_layout(1),
+                            cute.group_modes(sY2_stage, 0, 2),
+                            tygY2_for_tma,
+                        )
+
                         for epi_v in cutlass.range_constexpr(cute.size(acc2)):
                             tRS_rY2[epi_v] = acc2[epi_v].to(self.y2_dtype)
                         cute.copy(tiled_copy_Y_r2s, tRS_rY2, tRS_sY2)
@@ -2775,12 +2786,8 @@ class HopperWgmma_MoE_kernel:
                         cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
                         epilogue_barrier.arrive_and_wait()
                         
-                        gY2_mn = cute.local_tile(tma_tensor_y2, (self.tile_M, self.tile_N2), (tile_coord_mnkl[0], w2_n_idx))
-                        tYsY, tYgY_mnl = cpasync.tma_partition(
-                            tma_atom_y2, 0, cute.make_layout(1), cute.group_modes(sY2, 0, 2), cute.group_modes(gY2_mn, 0, 2)
-                        )
                         if is_tma_warp:
-                            cute.copy(tma_atom_y2, tYsY[None, 0], tYgY_mnl[None, 0])
+                            cute.copy(tma_atom_y2, bSG_sY2[None, 0], bSG_gY2[None, 0])
                             cute.arch.cp_async_bulk_commit_group()
                             cute.arch.cp_async_bulk_wait_group(0, read=True)
                         epilogue_barrier.arrive_and_wait()
