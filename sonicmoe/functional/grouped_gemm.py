@@ -2694,7 +2694,7 @@ class HopperWgmma_MoE_kernel:
                     w2_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, 2)
                     
                     tCrA2 = tiled_mma_w2.get_slice(tidx).partition_A(sA2)
-                    tCrW2 = tiled_mma_w2.get_slice(tidx).partition_B(sW2)
+                    # tCrW2 is partitioned per-stage inside the loop to avoid rank mismatch
                     
                     tRS_sY2 = tiled_copy_Y_r2s.get_slice(tidx).partition_D(sY2)
 
@@ -2753,8 +2753,10 @@ class HopperWgmma_MoE_kernel:
                         tiled_mma_w2.set(warpgroup.Field.ACCUMULATE, False)
 
                         w2_pipeline.consumer_wait(w2_read_state)
-                        
-                        cute.gemm(tiled_mma_w2, acc2, tCrA2, tCrW2[None, None, w2_read_state.index], acc2)
+                        # Partition B for this stage slice — avoids rank mismatch from indexing a 4-mode partition
+                        sW2_stage = sW2[None, None, w2_read_state.index]
+                        tCrW2_stage = tiled_mma_w2.get_slice(tidx).partition_B(sW2_stage)
+                        cute.gemm(tiled_mma_w2, acc2, tCrA2, tCrW2_stage, acc2)
                         
                         w2_pipeline.consumer_release(w2_read_state)
                         w2_read_state.advance()
