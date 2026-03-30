@@ -2698,7 +2698,11 @@ class HopperWgmma_MoE_kernel:
                     tCrA2 = tiled_mma_w2.get_slice(tidx).partition_A(sA2[None, None, 0])
                     # tCrW2 is partitioned per-stage inside the loop to avoid rank mismatch
                     
-                    tRS_sY2 = tiled_copy_Y_r2s.get_slice(tidx).partition_D(sY2)
+                    # Slice stage dim from sY2 first so partition_D produces rank-3 (matching register tensor)
+                    sY2_stage = sY2[None, None, 0]
+                    tRS_sY2 = tiled_copy_Y_r2s.get_slice(tidx).partition_D(sY2_stage)
+                    # y2 register buffer — same shape as tRS_sY2 but in registers, y2 dtype
+                    tRS_rY2 = cute.make_rmem_tensor(tRS_sY2.shape, self.y2_dtype)
 
                     # W2 is multicast across the M-cluster dimension.
                     cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()))
@@ -2765,8 +2769,8 @@ class HopperWgmma_MoE_kernel:
 
                         # --- Epilogue: store y2 tile to HBM ---
                         for epi_v in cutlass.range_constexpr(cute.size(acc2)):
-                            tRS_rY[epi_v] = acc2[epi_v].to(self.y2_dtype)
-                        cute.copy(tiled_copy_Y_r2s, tRS_rY, tRS_sY2)
+                            tRS_rY2[epi_v] = acc2[epi_v].to(self.y2_dtype)
+                        cute.copy(tiled_copy_Y_r2s, tRS_rY2, tRS_sY2)
                         
                         cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
                         epilogue_barrier.arrive_and_wait()
