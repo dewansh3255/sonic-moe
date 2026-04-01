@@ -865,7 +865,7 @@ class HopperWgmma_MoE_kernel:
                 self.w2_layout.sm90_mma_major_mode(),
                 self.acc_dtype,
                 self.atom_layout_mnk,
-                tiler_mn=(64, self.tile_N2 // self.atom_layout_mnk[1]),
+                tiler_mn=(64, 64 // self.atom_layout_mnk[1]),
             )
         else:
             tiled_mma_w2 = None
