@@ -966,10 +966,9 @@ class HopperWgmma_MoE_kernel:
             w2_b_is_k_major = self.w2_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
             w2_b_smem_shape = (self.tile_N2, self.tile_K2)
             w2_b_major_mode_size = self.tile_K2 if w2_b_is_k_major else self.tile_N2
-            w2_b_smem_layout_atom = warpgroup.make_smem_layout_atom(
-                sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, w2_b_major_mode_size),
-                self.w2_dtype,
-            )
+            w2_b_swizzle_atom = sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, w2_b_major_mode_size)
+            w2_b_smem_layout_atom = warpgroup.make_smem_layout_atom(w2_b_swizzle_atom, self.w2_dtype)
+            
             self.w2_stage = 2
             self.w2_smem_layout_staged = cute.tile_to_shape(
                 w2_b_smem_layout_atom,
@@ -980,7 +979,7 @@ class HopperWgmma_MoE_kernel:
             w2_tma_n = min(self.tile_N2, 64) if not w2_b_is_k_major else self.tile_N2
             w2_tma_k = min(self.tile_K2, 64) if w2_b_is_k_major else self.tile_K2
             w2_tma_smem_layout_staged = cute.tile_to_shape(
-                w2_b_smem_layout_atom,
+                w2_b_swizzle_atom,
                 cute.append((w2_tma_n, w2_tma_k), 1),
                 order=(0, 1, 2) if w2_b_is_k_major else (1, 0, 2),
             )
@@ -990,10 +989,9 @@ class HopperWgmma_MoE_kernel:
 
             y2_d_smem_shape = (self.tile_M, self.tile_N2)
             y2_d_major_mode_size = self.tile_N2 if self.y2_layout.is_n_major_c() else self.tile_M
-            y2_d_smem_layout_atom = warpgroup.make_smem_layout_atom(
-                sm90_utils.get_smem_layout_atom(self.y2_layout, self.y2_dtype, y2_d_major_mode_size),
-                self.y2_dtype,
-            )
+            y2_d_swizzle_atom = sm90_utils.get_smem_layout_atom(self.y2_layout, self.y2_dtype, y2_d_major_mode_size)
+            y2_d_smem_layout_atom = warpgroup.make_smem_layout_atom(y2_d_swizzle_atom, self.y2_dtype)
+            
             self.y2_epi_stage = 1
             self.y2_epi_smem_layout_staged = cute.tile_to_shape(
                 y2_d_smem_layout_atom,
@@ -1006,7 +1004,7 @@ class HopperWgmma_MoE_kernel:
             self.y2_epi_tile_mn = (y2_epi_tile_m, y2_epi_tile_n)
             
             y2_tma_smem_layout_staged = cute.tile_to_shape(
-                y2_d_smem_layout_atom,
+                y2_d_swizzle_atom,
                 cute.append(self.y2_epi_tile_mn, 1),
                 order=(1, 0, 2) if self.y2_layout.is_m_major_c() else (0, 1, 2)
             )
