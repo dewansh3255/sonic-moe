@@ -2763,18 +2763,18 @@ class HopperWgmma_MoE_kernel:
                         sW2_stage = sW2[None, None, w2_read_state.index]
                         tCrW2_s = tiled_mma_w2.get_slice(tidx).partition_B(sW2_stage)
 
-                        # Manual loop unrolling for WGMMA SS
-                        # By explicitly indexing over n and k atoms, we bypass MLIR verifier limitations that 
-                        # prohibit descriptor strides spanning across disjoint 64-element K-swizzle atoms.
-                        for n in cutlass.range_constexpr(cute.size(tCrW2_s, mode=[1])):
-                            for k in cutlass.range_constexpr(cute.size(tCrW2_s, mode=[2])):
-                                cute.gemm(
-                                    tiled_mma_w2, 
-                                    acc2[None, 0, n], 
-                                    tCrA2[None, 0, k], 
-                                    tCrW2_s[None, n, k], 
-                                    acc2[None, 0, n]
-                                )
+                        # Create WGMMA HW Descriptor proxy tensors. 
+                        # make_fragment cleanly handles allocating descriptors that dynamically bypass Swizzle 64x64 Atom limits in K
+                        tCrA2_desc = tiled_mma_w2.make_fragment_A(tCrA2)
+                        tCrW2_desc = tiled_mma_w2.make_fragment_B(tCrW2_s)
+
+                        cute.gemm(
+                            tiled_mma_w2, 
+                            acc2, 
+                            tCrA2_desc, 
+                            tCrW2_desc, 
+                            acc2
+                        )
                         
                         w2_pipeline.consumer_release(w2_read_state)
                         w2_read_state.advance()
