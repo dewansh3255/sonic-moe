@@ -2766,8 +2766,8 @@ class HopperWgmma_MoE_kernel:
                         # Manual loop unrolling for WGMMA SS
                         # By explicitly indexing over n and k atoms, we bypass MLIR verifier limitations that 
                         # prohibit descriptor strides spanning across disjoint 64-element K-swizzle atoms.
-                        for n in cutlass.range_constexpr(cute.size(tCrW2_s, 1)):
-                            for k in cutlass.range_constexpr(cute.size(tCrW2_s, 2)):
+                        for n in cutlass.range_constexpr(cute.size(tCrW2_s, mode=[1])):
+                            for k in cutlass.range_constexpr(cute.size(tCrW2_s, mode=[2])):
                                 cute.gemm(
                                     tiled_mma_w2, 
                                     acc2[None, 0, n], 
