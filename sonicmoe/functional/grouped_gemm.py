@@ -975,11 +975,19 @@ class HopperWgmma_MoE_kernel:
                 cute.append(w2_b_smem_shape, self.w2_stage),
                 order=(0, 1, 2) if w2_b_is_k_major else (1, 0, 2),
             )
-            # Bound TMA block dimensions to Swizzle capability (64 items)
+            # Bound TMA block dimensions to 64 elements (128 bytes) for Hopper TMA Swizzle compliance.
+            # CRITICAL: sm90_utils.get_smem_layout_atom returns a Python descriptor, NOT an MLIR Value.
+            # We must wrap it in warpgroup.make_smem_layout_atom to get an MLIR Value for tile_to_shape.
+            # Use a *separate* bounded atom with capped major_mode_size for TMA, distinct from the full SMEM atom.
             w2_tma_n = min(self.tile_N2, 64) if not w2_b_is_k_major else self.tile_N2
             w2_tma_k = min(self.tile_K2, 64) if w2_b_is_k_major else self.tile_K2
+            w2_tma_major_mode_size = w2_tma_k if w2_b_is_k_major else w2_tma_n
+            w2_tma_smem_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, w2_tma_major_mode_size),
+                self.w2_dtype,
+            )
             w2_tma_smem_layout_staged = cute.tile_to_shape(
-                w2_b_swizzle_atom,
+                w2_tma_smem_layout_atom,
                 cute.append((w2_tma_n, w2_tma_k), 1),
                 order=(0, 1, 2) if w2_b_is_k_major else (1, 0, 2),
             )
@@ -998,13 +1006,18 @@ class HopperWgmma_MoE_kernel:
                 cute.append(y2_d_smem_shape, self.y2_epi_stage),
                 order=(1, 0, 2) if self.y2_layout.is_m_major_c() else (0, 1, 2)
             )
-            # The continuous dimension must be bounded to 64 elements (128 bytes) to map to Hopper TMA Swizzles
+            # Bounded TMA tile for Y2: capped to 64 elements in the contiguous dimension.
+            # Again, must use warpgroup.make_smem_layout_atom (not raw swizzle atom) for MLIR Value.
             y2_epi_tile_m = min(self.tile_M, 64) if self.y2_layout.is_m_major_c() else self.tile_M
             y2_epi_tile_n = min(self.tile_N2, 64) if self.y2_layout.is_n_major_c() else self.tile_N2
             self.y2_epi_tile_mn = (y2_epi_tile_m, y2_epi_tile_n)
-            
+            y2_tma_major_mode_size = y2_epi_tile_n if self.y2_layout.is_n_major_c() else y2_epi_tile_m
+            y2_tma_smem_layout_atom = warpgroup.make_smem_layout_atom(
+                sm90_utils.get_smem_layout_atom(self.y2_layout, self.y2_dtype, y2_tma_major_mode_size),
+                self.y2_dtype,
+            )
             y2_tma_smem_layout_staged = cute.tile_to_shape(
-                y2_d_swizzle_atom,
+                y2_tma_smem_layout_atom,
                 cute.append(self.y2_epi_tile_mn, 1),
                 order=(1, 0, 2) if self.y2_layout.is_m_major_c() else (0, 1, 2)
             )
