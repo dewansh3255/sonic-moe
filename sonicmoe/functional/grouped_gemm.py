@@ -976,8 +976,11 @@ class HopperWgmma_MoE_kernel:
                 cute.append(w2_b_smem_shape, self.w2_stage),
                 order=(0, 1, 2) if w2_b_is_k_major else (1, 0, 2),
             )
+            # Bound TMA block dimensions to Swizzle capability (64 items)
+            w2_tma_n = min(self.tile_N2, 64) if not w2_b_is_k_major else self.tile_N2
+            w2_tma_k = min(self.tile_K2, 64) if w2_b_is_k_major else self.tile_K2
             tma_atom_w2, tma_tensor_w2 = self._make_tma_atoms_and_tensors(
-                mW2, self.w2_smem_layout_staged, (self.tile_N2, self.tile_K2), self.cluster_shape_mnk[0]
+                mW2, self.w2_smem_layout_staged, (w2_tma_n, w2_tma_k), self.cluster_shape_mnk[0]
             )
 
             y2_d_smem_shape = (self.tile_M, self.tile_N2)
@@ -992,8 +995,12 @@ class HopperWgmma_MoE_kernel:
                 cute.append(y2_d_smem_shape, self.y2_epi_stage),
                 order=(1, 0, 2) if self.y2_layout.is_m_major_c() else (0, 1, 2)
             )
+            # The continuous dimension must be bounded to 64 elements (128 bytes) to map to Hopper TMA Swizzles
+            y2_epi_tile_m = min(self.tile_M, 64) if self.y2_layout.is_m_major_c() else self.tile_M
+            y2_epi_tile_n = min(self.tile_N2, 64) if self.y2_layout.is_n_major_c() else self.tile_N2
+            self.y2_epi_tile_mn = (y2_epi_tile_m, y2_epi_tile_n)
             tma_atom_y2, tma_tensor_y2 = self._make_tma_epi_atoms_and_tensors(
-                mY2, self.y2_epi_smem_layout_staged, y2_d_smem_shape, store_or_load="store"
+                mY2, self.y2_epi_smem_layout_staged, self.y2_epi_tile_mn, store_or_load="store"
             )
 
             # A2 (y1 input to WGMMA Phase 2) layout — use same layout as input A (X tensor)
