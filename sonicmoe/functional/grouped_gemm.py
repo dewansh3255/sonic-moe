@@ -817,7 +817,8 @@ class HopperWgmma_MoE_kernel:
             self.y2_dtype = mY2.element_type
             self.y2_layout = utils.LayoutEnum.from_tensor(mY2)
             self.tile_N2 = 128
-            self.tile_K2 = 128
+            # tile_K2 is capped (<=128) to stay within SMEM/TMA budgets; kernel loops over K so it still covers I.
+            self.tile_K2 = self.fused_tile_k2
 
         if const_expr(mC is not None):
             assert self.acc_dtype == cutlass.Float32
@@ -963,25 +964,25 @@ class HopperWgmma_MoE_kernel:
             tma_atom_y, tma_tensor_y = None, None
 
         if const_expr(self.fuse_down_projection):
-            w2_b_is_k_major = self.w2_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
+            w2_b_is_k_major = const_expr(self.w2_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K)
             w2_b_smem_shape = (self.tile_N2, self.tile_K2)
-            w2_b_major_mode_size = self.tile_K2 if w2_b_is_k_major else self.tile_N2
-            w2_b_swizzle_atom = sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, w2_b_major_mode_size)
+            w2_b_major_mode_size = self.tile_K2 if const_expr(w2_b_is_k_major) else self.tile_N2
+            w2_b_swizzle_atom = sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, int(w2_b_major_mode_size))
             w2_b_smem_layout_atom = warpgroup.make_smem_layout_atom(w2_b_swizzle_atom, self.w2_dtype)
             
             self.w2_stage = 2
             self.w2_smem_layout_staged = cute.tile_to_shape(
                 w2_b_smem_layout_atom,
                 cute.append(w2_b_smem_shape, self.w2_stage),
-                order=(0, 1, 2) if w2_b_is_k_major else (1, 0, 2),
+                order=(0, 1, 2) if const_expr(w2_b_is_k_major) else (1, 0, 2),
             )
             # Bound TMA block dimensions to 64 elements (128 bytes) for Hopper TMA Swizzle compliance.
             # CRITICAL: sm90_utils.get_smem_layout_atom returns a Python descriptor, NOT an MLIR Value.
             # We must wrap it in warpgroup.make_smem_layout_atom to get an MLIR Value for tile_to_shape.
             # Use a *separate* bounded atom with capped major_mode_size for TMA, distinct from the full SMEM atom.
-            w2_tma_n = min(self.tile_N2, 64) if not w2_b_is_k_major else self.tile_N2
-            w2_tma_k = min(self.tile_K2, 64) if w2_b_is_k_major else self.tile_K2
-            w2_tma_major_mode_size = w2_tma_k if w2_b_is_k_major else w2_tma_n
+            w2_tma_n = min(self.tile_N2, 64) if not const_expr(w2_b_is_k_major) else self.tile_N2
+            w2_tma_k = min(self.tile_K2, 64) if const_expr(w2_b_is_k_major) else self.tile_K2
+            w2_tma_major_mode_size = w2_tma_k if const_expr(w2_b_is_k_major) else w2_tma_n
             w2_tma_smem_layout_atom = warpgroup.make_smem_layout_atom(
                 sm90_utils.get_smem_layout_atom(self.w2_layout, self.w2_dtype, w2_tma_major_mode_size),
                 self.w2_dtype,
@@ -989,14 +990,14 @@ class HopperWgmma_MoE_kernel:
             w2_tma_smem_layout_staged = cute.tile_to_shape(
                 w2_tma_smem_layout_atom,
                 cute.append((w2_tma_n, w2_tma_k), 1),
-                order=(0, 1, 2) if w2_b_is_k_major else (1, 0, 2),
+                order=(0, 1, 2) if const_expr(w2_b_is_k_major) else (1, 0, 2),
             )
             tma_atom_w2, tma_tensor_w2 = self._make_tma_atoms_and_tensors(
                 mW2, w2_tma_smem_layout_staged, (w2_tma_n, w2_tma_k), self.cluster_shape_mnk[0]
             )
 
             y2_d_smem_shape = (self.tile_M, self.tile_N2)
-            y2_d_major_mode_size = self.tile_N2 if self.y2_layout.is_n_major_c() else self.tile_M
+            y2_d_major_mode_size = self.tile_N2 if const_expr(self.y2_layout.is_n_major_c()) else self.tile_M
             y2_d_swizzle_atom = sm90_utils.get_smem_layout_atom(self.y2_layout, self.y2_dtype, y2_d_major_mode_size)
             y2_d_smem_layout_atom = warpgroup.make_smem_layout_atom(y2_d_swizzle_atom, self.y2_dtype)
             
@@ -1004,14 +1005,14 @@ class HopperWgmma_MoE_kernel:
             self.y2_epi_smem_layout_staged = cute.tile_to_shape(
                 y2_d_smem_layout_atom,
                 cute.append(y2_d_smem_shape, self.y2_epi_stage),
-                order=(1, 0, 2) if self.y2_layout.is_m_major_c() else (0, 1, 2)
+                order=(1, 0, 2) if const_expr(self.y2_layout.is_m_major_c()) else (0, 1, 2)
             )
             # Bounded TMA tile for Y2: capped to 64 elements in the contiguous dimension.
             # Again, must use warpgroup.make_smem_layout_atom (not raw swizzle atom) for MLIR Value.
-            y2_epi_tile_m = min(self.tile_M, 64) if self.y2_layout.is_m_major_c() else self.tile_M
-            y2_epi_tile_n = min(self.tile_N2, 64) if self.y2_layout.is_n_major_c() else self.tile_N2
+            y2_epi_tile_m = min(self.tile_M, 64) if const_expr(self.y2_layout.is_m_major_c()) else self.tile_M
+            y2_epi_tile_n = min(self.tile_N2, 64) if const_expr(self.y2_layout.is_n_major_c()) else self.tile_N2
             self.y2_epi_tile_mn = (y2_epi_tile_m, y2_epi_tile_n)
-            y2_tma_major_mode_size = y2_epi_tile_n if self.y2_layout.is_n_major_c() else y2_epi_tile_m
+            y2_tma_major_mode_size = y2_epi_tile_n if const_expr(self.y2_layout.is_n_major_c()) else y2_epi_tile_m
             y2_tma_smem_layout_atom = warpgroup.make_smem_layout_atom(
                 sm90_utils.get_smem_layout_atom(self.y2_layout, self.y2_dtype, y2_tma_major_mode_size),
                 self.y2_dtype,
@@ -1019,7 +1020,7 @@ class HopperWgmma_MoE_kernel:
             y2_tma_smem_layout_staged = cute.tile_to_shape(
                 y2_tma_smem_layout_atom,
                 cute.append(self.y2_epi_tile_mn, 1),
-                order=(1, 0, 2) if self.y2_layout.is_m_major_c() else (0, 1, 2)
+                order=(1, 0, 2) if const_expr(self.y2_layout.is_m_major_c()) else (0, 1, 2)
             )
             tma_atom_y2, tma_tensor_y2 = self._make_tma_epi_atoms_and_tensors(
                 mY2, y2_tma_smem_layout_staged, self.y2_epi_tile_mn, store_or_load="store"
@@ -1027,8 +1028,8 @@ class HopperWgmma_MoE_kernel:
 
             # A2 (y1 input to WGMMA Phase 2) layout — use same layout as input A (X tensor)
             a2_smem_shape = (self.tile_M, self.tile_K2)
-            a2_is_k_major = self.a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
-            a2_major_mode_size = self.tile_K2 if a2_is_k_major else self.tile_M
+            a2_is_k_major = const_expr(self.a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K)
+            a2_major_mode_size = self.tile_K2 if const_expr(a2_is_k_major) else self.tile_M
             a2_smem_layout_atom = warpgroup.make_smem_layout_atom(
                 sm90_utils.get_smem_layout_atom(self.a_layout, self.y_dtype, a2_major_mode_size),
                 self.y_dtype,
@@ -1036,7 +1037,7 @@ class HopperWgmma_MoE_kernel:
             self.a2_smem_layout_staged = cute.tile_to_shape(
                 a2_smem_layout_atom,
                 cute.append(a2_smem_shape, 1),
-                order=(0, 1, 2) if a2_is_k_major else (1, 0, 2),
+                order=(0, 1, 2) if const_expr(a2_is_k_major) else (1, 0, 2),
             )
         else:
             tma_atom_w2 = tma_tensor_w2 = tma_atom_y2 = tma_tensor_y2 = None

@@ -6,6 +6,7 @@ import os
 
 import torch
 import torch.nn.functional as F
+from cutlass.base_dsl.common import DSLCudaRuntimeError
 from quack.gemm_interface import gemm
 
 from ..count_cumsum import count_cumsum
@@ -126,12 +127,31 @@ class _UpProjection(torch.autograd.Function):
         # O1: Fused up+down projection (in SMEM, never touches HBM for y1).
         # Gated to False until the CuTe-DSL fused kernel body is implemented
         # in grouped_gemm.py and HopperWgmma_MoE_FusedUpDown_Fwd is wired in.
+        capture_active = False
+        try:
+            capture_active = torch.cuda.is_current_stream_capturing()
+        except AttributeError:
+            try:
+                capture_active = torch.cuda._is_current_stream_capturing()  # pragma: no cover
+            except Exception:
+                capture_active = False
+
+        arch_missing = os.getenv("CUTE_DSL_ARCH") is None
+        fused_disabled = (
+            os.getenv("SONICMOE_DISABLE_FUSED", "0").lower() in {"1", "true", "yes"}
+            or is_inference_mode_enabled
+            or capture_active
+            or arch_missing
+        )
         use_fused_kernel = (
             not is_using_quack_gemm()
             and I <= 256
             and w2 is not None
             and is_glu_activation
+            and not fused_disabled
         )
+
+        y2_fused = None
 
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
@@ -144,31 +164,50 @@ class _UpProjection(torch.autograd.Function):
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
             )
-            y2_fused = None
         elif use_fused_kernel:
             # O1: Fused up+down projection — y1 stays in SMEM, never touches HBM
             H_model = w2.size(0)  # w2 is (H, I, E)
-            z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
-            y2 = torch.empty(TK, H_model, dtype=x.dtype, device=x.device)
-            _fused_up_down_projection_forward(
-                x=x,
-                w1=w1,
-                w2=w2,
-                z=z,
-                y2=y2,
-                b1=b1,
-                b2=b2,
-                expert_frequency_offset=expert_frequency_offset,
-                expert_schedule_order=None,
-                x_gather_idx=x_gather_idx,
-                stream_id=stream_id,
-                activation_type=activation_type.value,
-                is_glu_activation=is_glu_activation,
-                is_inference_mode_enabled=is_inference_mode_enabled,
-            )
-            y1 = None  # Signal to _DownProjection that y2 is pre-computed
-            y2_fused = y2
-        else:
+            try:
+                z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
+                y2 = torch.empty(TK, H_model, dtype=x.dtype, device=x.device)
+                _fused_up_down_projection_forward(
+                    x=x,
+                    w1=w1,
+                    w2=w2,
+                    z=z,
+                    y2=y2,
+                    b1=b1,
+                    b2=b2,
+                    expert_frequency_offset=expert_frequency_offset,
+                    expert_schedule_order=None,
+                    x_gather_idx=x_gather_idx,
+                    stream_id=stream_id,
+                    activation_type=activation_type.value,
+                    is_glu_activation=is_glu_activation,
+                    is_inference_mode_enabled=is_inference_mode_enabled,
+                )
+                y1 = None  # Signal to _DownProjection that y2 is pre-computed
+                y2_fused = y2
+            except DSLCudaRuntimeError as e:
+                fail_fast = os.getenv("SONICMOE_FUSED_FAIL_FAST", "0").lower() in {"1", "true", "yes"}
+                if fail_fast:
+                    raise
+                if arch_missing and not getattr(_UpProjection, "_warned_arch_env", False):
+                    print(
+                        "[SonicMoE] CUTE_DSL_ARCH is not set; skipping fused up+down kernel. "
+                        "Set CUTE_DSL_ARCH=sm_90a on Hopper/Blackwell to enable."
+                    )
+                    _UpProjection._warned_arch_env = True
+                if not getattr(_UpProjection, "_warned_fused_fallback", False):
+                    print(
+                        f"[SonicMoE] Fused up+down kernel failed ({e}); falling back to unfused path. "
+                        "Set SONICMOE_FUSED_FAIL_FAST=1 to error instead."
+                    )
+                    _UpProjection._warned_fused_fallback = True
+                use_fused_kernel = False
+
+        # Fallback: unfused up-projection if fused path is disabled or fails
+        if (not is_using_quack_gemm()) and (not use_fused_kernel or y2_fused is None):
             z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
             y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
             _up_projection_forward(
@@ -185,7 +224,6 @@ class _UpProjection(torch.autograd.Function):
                 is_glu_activation=is_glu_activation,
                 is_inference_mode_enabled=is_inference_mode_enabled,
             )
-            y2_fused = None
 
         ctx.T = T
         ctx.TK = TK

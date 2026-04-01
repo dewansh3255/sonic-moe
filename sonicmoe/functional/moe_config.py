@@ -318,6 +318,9 @@ class HopperWgmma_MoE_FusedUpDown_Fwd:
             inference_mode=inference_mode,
             fuse_down_projection=True,
         )
+        # K2 tile for fused down-projection. Keep at most 128 to stay within SMEM/TMA limits
+        # on Hopper; the kernel loops over K so it still covers the full width.
+        self.module.fused_tile_k2 = min(I, 128)
         self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
             up_config.cluster_shape_mnk[0] * up_config.cluster_shape_mnk[1]
         )
